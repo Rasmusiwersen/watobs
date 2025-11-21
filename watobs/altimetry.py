@@ -4,6 +4,7 @@ import requests
 import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
+import mikeio
 
 
 class APIAuthenticationFailed(Exception):
@@ -79,8 +80,6 @@ class AltimetryData:
             if 1 is given as argument data with flag 0 and 1 will be written to
             file, by default 0 (i.e. only good data)
         """
-        from mikeio import eum
-
         df = self.df
         if satellite is not None:
             df = df[df.satellite == satellite]
@@ -97,16 +96,17 @@ class AltimetryData:
             "significant_wave_height",
             "wind_speed",
         ]
-        items = []
-        items.append(eum.ItemInfo("Longitude", eum.EUMType.Latitude_longitude))
-        items.append(eum.ItemInfo("Latitude", eum.EUMType.Latitude_longitude))
-        items.append(eum.ItemInfo("Water Level", eum.EUMType.Water_Level))
-        items.append(
-            eum.ItemInfo("Significant Wave Height", eum.EUMType.Significant_wave_height)
-        )
-        items.append(eum.ItemInfo("Wind Speed", eum.EUMType.Wind_speed))
+        items = [
+            mikeio.ItemInfo("Longitude", mikeio.EUMType.Latitude_longitude),
+            mikeio.ItemInfo("Latitude", mikeio.EUMType.Latitude_longitude),
+            mikeio.ItemInfo("Water Level", mikeio.EUMType.Water_Level),
+            mikeio.ItemInfo(
+                "Significant Wave Height", mikeio.EUMType.Significant_wave_height
+            ),
+            mikeio.ItemInfo("Wind Speed", mikeio.EUMType.Wind_speed),
+        ]
 
-        df[cols].to_dfs0(filename, items=items)
+        mikeio.from_pandas(df[cols], items=items).to_dfs(filename)
 
     def plot_map(self, fig_size=(9, 9), markersize=10):
         """plot map of altimetry data
