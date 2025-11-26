@@ -736,3 +736,437 @@ class DHIAltimetryRepository:
             else:
                 raise InvalidSatelliteName("Invalid satellite name: " + sat)
         return satellite_strings
+    
+class CMEMSSatObsRepository:
+    
+    # Move all of these to the top later
+    import copernicusmarine
+    import pandas as pd
+    import shutil
+    import os
+    import glob
+    import calendar
+    import xarray
+    import numpy as np
+    from mpl_toolkits.basemap import Basemap
+    import os
+    import tempfile
+    import calendar
+    import pandas as pd
+    import copernicusmarine
+
+    def download_copernicus_data(dataset_id, 
+                                start_year=2020, 
+                                end_year=2020,
+                                start_month=1,
+                                end_month=12,
+                                area=None):
+        # Get the number of days in the month
+        end_day = calendar.monthrange(end_year, end_month)[1]
+        strt_tm = pd.to_datetime(f"{start_year}-{'{:02d}'.format(start_month)}-01", format="ISO8601")
+        end_tm = pd.to_datetime(f"{end_year}-{'{:02d}'.format(end_month)}-{end_day}", format="ISO8601")
+
+        # Handle area parsing
+        global_flag = True
+        if area is not None:
+            global_flag = False
+            parsed = False
+            if area.startswith("bbox=") and area.count(",") == 3:
+                parsed = True
+            elif area.startswith("polygon=") and area.count(",") >= 5:
+                parsed = True
+            elif area.startswith("lon=") and area.count("&lat=") == 1 and area.count("&radius=") == 1:
+                parsed = True
+            if not parsed:
+                raise ValueError("Invalid area format")
+
+            def _area_str_to_dict(area):
+                dd = {}
+                for token in area.split("&"):
+                    key, val = token.split("=")
+                    dd[key] = val
+                return dd
+
+            dd = _area_str_to_dict(area)
+            ar_split = dd['bbox'].split(',')
+
+        # Create a temporary directory
+        temp_dir = tempfile.mkdtemp(prefix="cmems_", dir=os.getcwd())
+        before = set(os.listdir(temp_dir))
+        print(f"Temporary directory created: {temp_dir}")
+
+        # Download logic
+        if not global_flag:
+            try:
+                print(f"-- Downloading subset of {dataset_id}")
+                copernicusmarine.subset(
+                    dataset_id=dataset_id,
+                    start_datetime=strt_tm.strftime("%Y-%m-%d"),
+                    end_datetime=end_tm.strftime("%Y-%m-%d"),
+                    minimum_longitude=float(ar_split[0]),
+                    maximum_longitude=float(ar_split[2]),
+                    minimum_latitude=float(ar_split[1]),
+                    maximum_latitude=float(ar_split[3]),
+                    output_directory=temp_dir,
+                )
+                print("-- Download successful.")
+            except:
+                for year in np.arange(start_year, end_year + 1):
+                    print(f"-- Spatial or temporal limits exceeded. Downloading full dataset for year {year}")
+                    copernicusmarine.get(
+                        dataset_id=dataset_id,
+                        output_directory=temp_dir,
+                        filter=f"*/{strt_tm.year}/*",
+                    )
+                print("-- Download successful.")
+        else:
+            for year in np.arange(start_year, end_year + 1):
+                print(f"- Downloading year {year} for dataset {dataset_id}.")
+                copernicusmarine.get(
+                    dataset_id=dataset_id,
+                    output_directory=temp_dir,
+                    filter=f"*/{year}/*",
+                )
+        after = set(os.listdir(temp_dir))
+        downloaded = after - before
+        if len(downloaded) == 1:
+            file_path = fr"{temp_dir}\{list(downloaded)[0]}"
+        else:
+            print("Concat .csv files or single files or whatever")
+
+        df = cmems_format_raw_data(temp_dir,
+                            file_path)
+        return df
+
+    def get_var_float64(f,varname):
+        data = f[varname].astype(np.float64)
+        scale_factor = f[varname].attrs.get('scale_factor', 1.0)
+        add_offset = f[varname].attrs.get('add_offset', 0.0)
+        data = data * scale_factor + add_offset
+        data = data.values.astype(np.float64).squeeze()
+        return data
+
+    def cmems_subset_wind_nc_to_df(file):
+        try:
+            f = xarray.open_dataset(file, decode_cf=False)
+        except FileNotFoundError:
+            print(f"File not found: {file}")
+            df = pd.DataFrame()
+            return df
+        except OSError as e:
+            print(f"Error opening file: {e}")
+            df = pd.DataFrame()
+            return df
+        except Exception as e:
+            print(f"An unexpected error occurred: {e}")
+            df = pd.DataFrame()
+            return df
+        #
+        try:
+            lon = f.longitude.values
+            lat = f.latitude.values
+        except:
+            lon = f.lon.values
+            lat = f.lat.values
+        xlon,xlat = np.meshgrid(lon,lat)
+        time = get_var_float64(f,'measurement_time')
+        ws = get_var_float64(f,'wind_speed')
+        wd = get_var_float64(f,'wind_to_dir')
+        uwnd = get_var_float64(f,'eastward_wind')
+        vwnd = get_var_float64(f,'northward_wind')
+        bs_date_unit = f.measurement_time.attrs['units']
+        if not bs_date_unit.endswith('00:00:00'):
+            bs_date_unit = bs_date_unit + ' 00:00:00'
+        base_date = pd.to_datetime(bs_date_unit,
+                                    format='seconds since %Y-%m-%d %H:%M:%S')
+
+        lat_idx, lon_idx = np.meshgrid(range(len(lat)), range(len(lon)), indexing='ij')
+        lat_idx = np.tile(lat_idx.flatten(), len(time))
+        lon_idx = np.tile(lon_idx.flatten(), len(time))
+
+        # Difference in how longitude and latitude is structure in global and subset (local) files, hence this piece of code
+        try:
+            # Build DataFrame
+            df = pd.DataFrame({
+                "time": time.flatten(),
+                "longitude": lon[lon_idx],
+                "latitude": lat[lat_idx],
+                "WS": ws.flatten(),
+                "WD" : wd.flatten(),
+                "U10" : uwnd.flatten(),
+                "V10" : vwnd.flatten()
+            })
+        except:
+            df = pd.DataFrame({
+            'time': time.flatten(),
+            'longitude': xlon.flatten(),
+            'latitude': xlat.flatten(),
+            'WS': ws.flatten(),
+            'WD': wd.flatten(),
+            'U10': uwnd.flatten(),
+            'V10': vwnd.flatten(),
+        })
+
+        time_deltas = pd.to_timedelta(df['time'], unit='s')
+        df['time'] = base_date+time_deltas#base_date+time_deltas
+        df = df.set_index('time')
+        return df
+
+    def cmems_glo_wind_nc_to_df(file):
+        try:
+            f = xarray.open_dataset(file, decode_cf=False)
+        except FileNotFoundError:
+            print(f"File not found: {file}")
+            df = pd.DataFrame()
+            return df
+        except OSError as e:
+            print(f"Error opening file: {e}")
+            df = pd.DataFrame()
+            return df
+        except Exception as e:
+            print(f"An unexpected error occurred: {e}")
+            df = pd.DataFrame()
+            return df
+        lon = f.lon.values
+        lat = f.lat.values
+        xlon,xlat = np.meshgrid(lon,lat)
+        time = get_var_float64(f,'measurement_time')
+        ws = get_var_float64(f,'wind_speed')
+        wd = get_var_float64(f,'wind_to_dir')
+        uwnd = get_var_float64(f,'eastward_wind')
+        vwnd = get_var_float64(f,'northward_wind')
+        df = pd.DataFrame({
+            'time': time.flatten(),
+            'longitude': xlon.flatten(),
+            'latitude': xlat.flatten(),
+            'WS': ws.flatten(),
+            'WD': wd.flatten(),
+            'U10': uwnd.flatten(),
+            'V10': vwnd.flatten(),
+        })
+        df = df[df['WS']>=0.0]
+        df = df.reset_index()
+        base_date = pd.to_datetime(f.measurement_time.attrs['units'],
+                                format='seconds since %Y-%m-%d %H:%M:%S')
+        time_deltas = pd.to_timedelta(df['time'], unit='s')
+        df['time'] = base_date+time_deltas
+        df = df.set_index('time')
+        return df
+
+    def cmems_wave_csv_to_df(file):
+        try:
+            with open(file, 'rb') as f:
+                print(f)
+                data = pd.read_csv(f)
+        except FileNotFoundError:
+            print(f"File not found: {file}")
+            df = pd.DataFrame()
+            return df
+        except OSError as e:
+            print(f"Error opening file: {e}")
+            df = pd.DataFrame()
+            return df
+        except Exception as e:
+            print(f"An unexpected error occurred: {e}")
+            df = pd.DataFrame()
+            return df
+        # Converting CMEMS WAVE .csv to rightly formatted .csv
+        df = data[data.variable == 'VAVH']
+
+        df.set_index('time', inplace = True)
+        df.index = pd.to_datetime(df.index).tz_localize(None)
+        df.index.strftime('%Y-%m-%d %H:%M:%S')
+        df = df.rename(columns={'value': 'SWH'})
+        df = df.drop(columns=['is_depth_from_producer', 
+                            'variable', 
+                            'platform_id', 
+                            'platform_type',
+                            'doi',
+                            'product_doi',
+                            'pressure',
+                            'depth',
+                            'institution'])
+        return df
+
+    def cmems_glo_wave_to_df(file):
+        try:
+            f = xarray.open_dataset(file, decode_times=False)
+        except FileNotFoundError:
+            print(f"File not found: {file}")
+            df = pd.DataFrame()
+            return df
+        except OSError as e:
+            print(f"Error opening file: {e}")
+            df = pd.DataFrame()
+            return df
+        except Exception as e:
+            print(f"An unexpected error occurred: {e}")
+            df = pd.DataFrame()
+            return df
+        #
+        df = f.to_pandas()
+        df = df.reset_index()
+
+        base_date = pd.to_datetime(f.first_meas_time[:19], 
+                                    format='%Y-%m-%d %H:%M:%S')
+
+        time_deltas = pd.to_timedelta(df.index-df.index[0], unit='s')
+        df['time'] = base_date+time_deltas
+        df = df.set_index('time')
+        df = df.rename(columns={'VAVH': 'SWH','VAVH_UNFILTERED': 'SWH_UNFILTERED'})
+        return df
+
+    def cmems_format_raw_data(temp_dir, file_path):
+
+        if os.path.isfile(file_path):
+            if 'cmems_obs-wave_glo_phy-swh' in file_path: 
+                df = cmems_wave_csv_to_df(file_path)
+                
+            elif 'cmems_obs-wind_glo_phy' in file_path: # Maybe this needs to change, right now only wind files are .nc
+                df = cmems_subset_wind_nc_to_df(file_path)
+
+            else:
+                print('Product unknown')
+            df.to_csv(os.path.join(file_path))
+            shutil.rmtree(temp_dir)
+
+        else:
+            for ds in os.listdir(file_path):
+                years = os.listdir(os.path.join(file_path, ds))
+                df = pd.DataFrame()
+                for year in years:
+                    print(f'Merging files for {year}')
+                    file_pattern = fr"{file_path}\{ds}\{year}\*\*.nc"
+                    files   = glob.glob(file_pattern)
+                    cfo = pd.DataFrame()
+                    for file in files:
+                        #print(os.path.basename(file))
+                        if cfo.empty:
+                            if 'WIND' in os.path.basename(file_path):
+                                cfo = cmems_glo_wind_nc_to_df(file)
+                            elif 'WAVE' in os.path.basename(file_path):
+                                cfo = cmems_glo_wave_to_df(file)
+                            else:
+                                #print('1')
+                                print('Product unknown')
+                        else:
+                            if 'WIND' in os.path.basename(file_path):
+                                sing_df = cmems_glo_wind_nc_to_df(file)
+
+                            elif 'WAVE' in os.path.basename(file_path):
+                                sing_df = cmems_glo_wave_to_df(file)
+                            else:
+                                #print('2')
+                                print('Product unknown')
+                            
+                            if sing_df.empty:
+                                print(f"Empty cfo data {os.path.basename(file)}, skip!")
+                                continue
+                            else:
+                                cfo = pd.concat([cfo, sing_df], axis=0)
+                                print(f'Reading {os.path.basename(file)}')
+                    df = pd.concat([df, cfo], axis=0)
+                    
+                    #print(f'Writing csv for {year}')
+        return df
+
+
+    def plot_cmems_glo(cfo,
+                        item,
+                        crns,
+                        dxm ,
+                        lon_0,
+                        lat_0,
+                        resolution,
+                        out_path = None):
+
+        plt.figure(figsize=(40, 20))
+        m = Basemap(
+            lon_0 = lon_0,
+            lat_0 = lat_0,
+            llcrnrlon = crns[0],
+            llcrnrlat = crns[2],
+            urcrnrlon = crns[1],
+            urcrnrlat = crns[3],
+            resolution=resolution)
+        m.drawcoastlines(color='gray',linewidth=0.5)
+        m.fillcontinents(color='gray')
+        m.drawparallels(np.arange(crns[2], crns[3], dxm),
+                        abels=[1,0,0,0],linewidth=0.5,
+                        color='lightgray',labelstyle='--')
+        m.drawmeridians(np.arange(crns[0], crns[1], dxm),
+                        labels=[0,0,0,1],linewidth=0.5,
+                        color='lightgray',labelstyle='--')
+        x, y = m(cfo['longitude'], cfo['latitude'])
+        cs = m.scatter(x,y,c=cfo[item],
+                        s=1,marker='o',
+                        cmap=plt.cm.jet,
+                        vmin=0,vmax=10)
+        cbar = m.colorbar(cs,location='bottom',pad="5%")
+        cbar.set_label(item)
+        #plt.title(f'{satname} SWH {year}')
+        if not out_path == None:
+            plt.savefig(out_path, dpi=300)
+        #plt.savefig(f'{outdir}/{year}_SWH.png', dpi=300)
+
+                                
+
+    def plot_cmems(cfo,
+                        item,
+                        crns,
+                        dxm,
+                        lon_0,
+                        lat_0,
+                        resolution,
+                        out_path = None):
+        
+        plt.figure(figsize=(40, 20))
+        plt.grid()
+        m = Basemap(
+            lon_0 = lon_0,
+            lat_0 = lat_0,
+            llcrnrlon = crns[0],
+            llcrnrlat = crns[2],
+            urcrnrlon = crns[1],
+            urcrnrlat = crns[3],
+            resolution=resolution)
+        m.drawcoastlines(color='gray',
+                        linewidth=0.5)
+
+        m.fillcontinents(color='gray')
+
+        m.drawparallels(np.arange(crns[2], 
+                                crns[3], 
+                                dxm),
+                        labels=[1,0,0,0],
+                        linewidth=0.5,
+                        color='lightgray',
+                        labelstyle='--')
+        
+        m.drawmeridians(np.arange(crns[0], 
+                                crns[1], 
+                                dxm),
+                        labels=[0,0,0,1],
+                        linewidth=0.5,
+                        color='lightgray',
+                        labelstyle='--')
+        
+        x, y = m(cfo['longitude'], 
+                cfo['latitude'])
+        
+        cs = m.scatter(x,
+                    y,
+                    c=cfo[item],
+                        s=1,
+                        marker='o',
+                        cmap=plt.cm.jet,
+                        vmin=0,vmax=10)
+        
+        cbar = m.colorbar(cs,
+                        location='bottom',
+                        pad="5%")
+        
+        cbar.set_label(f'{item}')
+        if not out_path == None:
+            plt.savefig(out_path, 
+                    dpi=300)
