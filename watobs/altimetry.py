@@ -4,7 +4,13 @@ import requests
 import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
-
+import copernicusmarine
+import shutil
+import glob
+import calendar
+import xarray
+import os
+import tempfile
 
 class APIAuthenticationFailed(Exception):
     pass
@@ -738,62 +744,147 @@ class DHIAltimetryRepository:
         return satellite_strings
     
 class CMEMSSatObsRepository:
-    
-    # Move all of these to the top later
-    import copernicusmarine
-    import pandas as pd
-    import shutil
-    import os
-    import glob
-    import calendar
-    import xarray
-    import numpy as np
-    from mpl_toolkits.basemap import Basemap
-    import os
-    import tempfile
-    import calendar
-    import pandas as pd
-    import copernicusmarine
+    # To be done:
+    # - Merge the four functions that converts CMEMS to df. Especially the .nc reading can be condensed.
 
-    def download_copernicus_data(dataset_id, 
-                                start_year=2020, 
-                                end_year=2020,
-                                start_month=1,
-                                end_month=12,
-                                area=None):
-        # Get the number of days in the month
-        end_day = calendar.monthrange(end_year, end_month)[1]
-        strt_tm = pd.to_datetime(f"{start_year}-{'{:02d}'.format(start_month)}-01", format="ISO8601")
-        end_tm = pd.to_datetime(f"{end_year}-{'{:02d}'.format(end_month)}-{end_day}", format="ISO8601")
+    def __init__(self, 
+                 dataset_id = None, 
+                 start_time = None, 
+                 end_time = None, 
+                 area = None):
+        
+        self.dataset_id = dataset_id
+        self.start_time = start_time
+        self.end_time = end_time
+        self.area = area
+
+    def _parse_datetime(date):
+        if date is None:
+            return None
+        return pd.to_datetime(date, format="ISO8601")
+
+    def _validate_area(self, area):
+        # polygon=6.811,54.993,8.009,54.993,8.009,57.154,6.811,57.154,6.811,54.993
+        # bbox=115.0,28.5,150.2,52.1
+        # lon=10.9&lat=55.9&radius=10.0
+        parsed = False
+        message = None
+        if area[0:5] == "bbox=":
+            if area.count(",") == 3:
+                parsed = True
+            else:
+                message = "bbox area should be provided as bbox=115.0,28.5,150.2,52.1"
+
+        elif area[0:8] == "polygon=":
+            if area.count(",") >= 5:
+                parsed = True
+            else:
+                message = "polygon area should be provided as polygon=6.811,54.993,8.009,54.993,8.009,57.154,6.811,57.154,6.811,54.993"
+
+        elif area[0:4] == "lon=":
+            if (area.count("&lat=") == 1) & (area.count("&radius=") == 1):
+                parsed = True
+            else:
+                message = (
+                    "circle area should be provided as lon=10.9&lat=55.9&radius=10.0"
+                )
+        else:
+            message = "area must be given as bbox=115.0,28.5,150.2,52.1 or polygon=6.811,54.993,8.009,54.993,8.009,57.154,6.811,57.154,6.811,54.993 or lon=10.9&lat=55.9&radius=10.0"
+
+        if not parsed:
+            raise Exception(f"Failed to parse area {area}! {message}")
+        return self._area_str_to_dict(area)
+
+    def _area_str_to_dict(self, area):
+        dd = {}
+        for token in area.split("&"):
+            key, val = token.split("=")
+            dd[key] = val
+        return dd
+
+    def download_copernicus_data(self, 
+                                 dataset_id = None, 
+                                 start_time = None, 
+                                 end_time = None, 
+                                 area = None):
+        """Main function that retrieves data from CMEMS through api requests
+
+        Parameters
+        ----------
+        dataset_id : str
+            String specifying the dataset to be downloaded, e.g. 'cmems_obs-wind_glo_phy_nrt_l3-hy2b-hscat-asc-0.25deg_P1D-i'
+        area : str
+            String specifying location of desired data.  The three forms allowed by the API are:
+                - polygon=6.811,54.993,8.009,54.993,8.009,57.154,6.811,57.154,6.811,54.993
+                - bbox=115,28,150,52
+                - lon=10.9&lat=55.9&radius=100
+        start_time : str, datetime, optional
+            Start of data to be retrieved, by default '20200101'
+        end_time : str, datetime, optional
+            End of data to be retrieved, by default datetime.now()
+        satellites : str, list of str, optional
+            Satellites to be downloaded, e.g. '', '3a', 'j3, by default ''
+        qual_filters : int, list[int], optional
+            Accepted qualities 0=god, 1=acceptable, 2=bad, e.g. [0, 1],
+            by default None meaning no filter (=all data)
+
+        Examples
+        --------
+        >>> repo = DHIAltimetryRepository(api_key="...")
+        >>> data = repo.get_altimetry_data("lon=10.9&lat=55.9&radius=10.0", start_time="2021")
+        Succesfully retrieved 133 records from API in 0.69 seconds
+
+        Returns
+        -------
+        DataFrame
+            With columns 'longitude', 'latitude', 'water_level', ...
+        """
+
+        if area is not None:
+            d = self._validate_area(area)
+        else:
+            d = {"start_date": None, "end_date": None}
+
+        if end_time is None:
+            end_time = datetime.now()
+
+        start_time = self._parse_datetime(start_time)
+        d["start_date"] = start_time.strftime("%Y%m%d")
+
+        if end_time:
+            end_time = self._parse_datetime(end_time)
+        else:
+            end_time = datetime.now()
+        d["end_date"] = end_time.strftime("%Y%m%d")
+
+        if start_time > end_time:
+            raise ValueError(
+                f"end time '{end_time}' must be greater than start time '{start_time}'!"
+            )
+
+        start_year = d['start_date'][0:4]
+        end_year = d['end_date'][0:4]
+        start_month = d['start_date'][4:6]
+        end_month = d['end_date'][4:6]
+        start_day = d['start_date'][6:8]
+        end_day = d['end_date'][6:8]
+
+        strt_tm = pd.to_datetime(f"{start_year}-{start_month}-{start_day}", format="ISO8601")
+        end_tm = pd.to_datetime(f"{end_year}-{end_month}-{end_day}", format="ISO8601")
 
         # Handle area parsing
         global_flag = True
+
         if area is not None:
             global_flag = False
             parsed = False
-            if area.startswith("bbox=") and area.count(",") == 3:
-                parsed = True
-            elif area.startswith("polygon=") and area.count(",") >= 5:
-                parsed = True
-            elif area.startswith("lon=") and area.count("&lat=") == 1 and area.count("&radius=") == 1:
-                parsed = True
-            if not parsed:
-                raise ValueError("Invalid area format")
 
-            def _area_str_to_dict(area):
-                dd = {}
-                for token in area.split("&"):
-                    key, val = token.split("=")
-                    dd[key] = val
-                return dd
-
-            dd = _area_str_to_dict(area)
+            dd = self._area_str_to_dict(area)
             ar_split = dd['bbox'].split(',')
 
         # Create a temporary directory
         temp_dir = tempfile.mkdtemp(prefix="cmems_", dir=os.getcwd())
         before = set(os.listdir(temp_dir))
-        print(f"Temporary directory created: {temp_dir}")
 
         # Download logic
         if not global_flag:
@@ -811,22 +902,28 @@ class CMEMSSatObsRepository:
                 )
                 print("-- Download successful.")
             except:
-                for year in np.arange(start_year, end_year + 1):
-                    print(f"-- Spatial or temporal limits exceeded. Downloading full dataset for year {year}")
+                for year in np.arange(int(start_year), int(end_year) + 1):
+                    print(f"-- Spatial or temporal limits exceeded. Downloading full dataset for {year}")
+                    for month in np.arange(int(start_month), int(end_month) + 1):
+                        month_name = calendar.month_name[month]
+                        print(f"-- {month_name}")
+                        copernicusmarine.get(
+                            dataset_id=dataset_id,
+                            output_directory=temp_dir,
+                            filter=f"*/{year}/{month:02d}/*",
+                        )
+                print("-- Download successful.")
+        else:
+            for year in np.arange(int(start_year), int(end_year) + 1):
+                print(f"- Downloading for {year}")
+                for month in np.arange(int(start_month), int(end_month) + 1):
+                    month_name = calendar.month_name[month]
+                    print(f"-- {month_name}")
                     copernicusmarine.get(
                         dataset_id=dataset_id,
                         output_directory=temp_dir,
-                        filter=f"*/{strt_tm.year}/*",
+                        filter=f"*/{year}/{month:02d}/*",
                     )
-                print("-- Download successful.")
-        else:
-            for year in np.arange(start_year, end_year + 1):
-                print(f"- Downloading year {year} for dataset {dataset_id}.")
-                copernicusmarine.get(
-                    dataset_id=dataset_id,
-                    output_directory=temp_dir,
-                    filter=f"*/{year}/*",
-                )
         after = set(os.listdir(temp_dir))
         downloaded = after - before
         if len(downloaded) == 1:
@@ -834,11 +931,11 @@ class CMEMSSatObsRepository:
         else:
             print("Concat .csv files or single files or whatever")
 
-        df = cmems_format_raw_data(temp_dir,
+        df = self.cmems_format_raw_data(temp_dir,
                             file_path)
         return df
 
-    def get_var_float64(f,varname):
+    def get_var_float64(self, f,varname):
         data = f[varname].astype(np.float64)
         scale_factor = f[varname].attrs.get('scale_factor', 1.0)
         add_offset = f[varname].attrs.get('add_offset', 0.0)
@@ -846,7 +943,7 @@ class CMEMSSatObsRepository:
         data = data.values.astype(np.float64).squeeze()
         return data
 
-    def cmems_subset_wind_nc_to_df(file):
+    def cmems_subset_wind_nc_to_df(self, file):
         try:
             f = xarray.open_dataset(file, decode_cf=False)
         except FileNotFoundError:
@@ -869,11 +966,11 @@ class CMEMSSatObsRepository:
             lon = f.lon.values
             lat = f.lat.values
         xlon,xlat = np.meshgrid(lon,lat)
-        time = get_var_float64(f,'measurement_time')
-        ws = get_var_float64(f,'wind_speed')
-        wd = get_var_float64(f,'wind_to_dir')
-        uwnd = get_var_float64(f,'eastward_wind')
-        vwnd = get_var_float64(f,'northward_wind')
+        time = self.get_var_float64(f,'measurement_time')
+        ws = self.get_var_float64(f,'wind_speed')
+        wd = self.get_var_float64(f,'wind_to_dir')
+        uwnd = self.get_var_float64(f,'eastward_wind')
+        vwnd = self.get_var_float64(f,'northward_wind')
         bs_date_unit = f.measurement_time.attrs['units']
         if not bs_date_unit.endswith('00:00:00'):
             bs_date_unit = bs_date_unit + ' 00:00:00'
@@ -912,7 +1009,7 @@ class CMEMSSatObsRepository:
         df = df.set_index('time')
         return df
 
-    def cmems_glo_wind_nc_to_df(file):
+    def cmems_glo_wind_nc_to_df(self, file):
         try:
             f = xarray.open_dataset(file, decode_cf=False)
         except FileNotFoundError:
@@ -930,11 +1027,11 @@ class CMEMSSatObsRepository:
         lon = f.lon.values
         lat = f.lat.values
         xlon,xlat = np.meshgrid(lon,lat)
-        time = get_var_float64(f,'measurement_time')
-        ws = get_var_float64(f,'wind_speed')
-        wd = get_var_float64(f,'wind_to_dir')
-        uwnd = get_var_float64(f,'eastward_wind')
-        vwnd = get_var_float64(f,'northward_wind')
+        time = self.get_var_float64(f,'measurement_time')
+        ws = self.get_var_float64(f,'wind_speed')
+        wd = self.get_var_float64(f,'wind_to_dir')
+        uwnd = self.get_var_float64(f,'eastward_wind')
+        vwnd = self.get_var_float64(f,'northward_wind')
         df = pd.DataFrame({
             'time': time.flatten(),
             'longitude': xlon.flatten(),
@@ -953,7 +1050,7 @@ class CMEMSSatObsRepository:
         df = df.set_index('time')
         return df
 
-    def cmems_wave_csv_to_df(file):
+    def cmems_wave_csv_to_df(self, file):
         try:
             with open(file, 'rb') as f:
                 print(f)
@@ -988,7 +1085,7 @@ class CMEMSSatObsRepository:
                             'institution'])
         return df
 
-    def cmems_glo_wave_to_df(file):
+    def cmems_glo_wave_to_df(self, file):
         try:
             f = xarray.open_dataset(file, decode_times=False)
         except FileNotFoundError:
@@ -1016,14 +1113,16 @@ class CMEMSSatObsRepository:
         df = df.rename(columns={'VAVH': 'SWH','VAVH_UNFILTERED': 'SWH_UNFILTERED'})
         return df
 
-    def cmems_format_raw_data(temp_dir, file_path):
+    def cmems_format_raw_data(self, temp_dir, file_path):
 
         if os.path.isfile(file_path):
             if 'cmems_obs-wave_glo_phy-swh' in file_path: 
-                df = cmems_wave_csv_to_df(file_path)
-                
+                f_type = ['file', 'cmems_obs-wave_glo_phy-swh']
+                df = self.cmems_wave_csv_to_df(file_path)
+
             elif 'cmems_obs-wind_glo_phy' in file_path: # Maybe this needs to change, right now only wind files are .nc
-                df = cmems_subset_wind_nc_to_df(file_path)
+                f_type = ['file', 'cmems_obs-wind_glo_phy']
+                df = self.cmems_subset_wind_nc_to_df(file_path)
 
             else:
                 print('Product unknown')
@@ -1039,134 +1138,34 @@ class CMEMSSatObsRepository:
                     file_pattern = fr"{file_path}\{ds}\{year}\*\*.nc"
                     files   = glob.glob(file_pattern)
                     cfo = pd.DataFrame()
+
                     for file in files:
-                        #print(os.path.basename(file))
                         if cfo.empty:
                             if 'WIND' in os.path.basename(file_path):
-                                cfo = cmems_glo_wind_nc_to_df(file)
+                                cfo = self.cmems_glo_wind_nc_to_df(file)
+
                             elif 'WAVE' in os.path.basename(file_path):
-                                cfo = cmems_glo_wave_to_df(file)
+                                cfo = self.cmems_glo_wave_to_df(file)
+
                             else:
-                                #print('1')
                                 print('Product unknown')
                         else:
                             if 'WIND' in os.path.basename(file_path):
-                                sing_df = cmems_glo_wind_nc_to_df(file)
+                                sing_df = self.cmems_glo_wind_nc_to_df(file)
 
                             elif 'WAVE' in os.path.basename(file_path):
-                                sing_df = cmems_glo_wave_to_df(file)
+                                sing_df = self.cmems_glo_wave_to_df(file)
+
                             else:
-                                #print('2')
                                 print('Product unknown')
-                            
+                                
                             if sing_df.empty:
                                 print(f"Empty cfo data {os.path.basename(file)}, skip!")
                                 continue
+                            
                             else:
                                 cfo = pd.concat([cfo, sing_df], axis=0)
                                 print(f'Reading {os.path.basename(file)}')
                     df = pd.concat([df, cfo], axis=0)
-                    
-                    #print(f'Writing csv for {year}')
+            shutil.rmtree(temp_dir)
         return df
-
-
-    def plot_cmems_glo(cfo,
-                        item,
-                        crns,
-                        dxm ,
-                        lon_0,
-                        lat_0,
-                        resolution,
-                        out_path = None):
-
-        plt.figure(figsize=(40, 20))
-        m = Basemap(
-            lon_0 = lon_0,
-            lat_0 = lat_0,
-            llcrnrlon = crns[0],
-            llcrnrlat = crns[2],
-            urcrnrlon = crns[1],
-            urcrnrlat = crns[3],
-            resolution=resolution)
-        m.drawcoastlines(color='gray',linewidth=0.5)
-        m.fillcontinents(color='gray')
-        m.drawparallels(np.arange(crns[2], crns[3], dxm),
-                        abels=[1,0,0,0],linewidth=0.5,
-                        color='lightgray',labelstyle='--')
-        m.drawmeridians(np.arange(crns[0], crns[1], dxm),
-                        labels=[0,0,0,1],linewidth=0.5,
-                        color='lightgray',labelstyle='--')
-        x, y = m(cfo['longitude'], cfo['latitude'])
-        cs = m.scatter(x,y,c=cfo[item],
-                        s=1,marker='o',
-                        cmap=plt.cm.jet,
-                        vmin=0,vmax=10)
-        cbar = m.colorbar(cs,location='bottom',pad="5%")
-        cbar.set_label(item)
-        #plt.title(f'{satname} SWH {year}')
-        if not out_path == None:
-            plt.savefig(out_path, dpi=300)
-        #plt.savefig(f'{outdir}/{year}_SWH.png', dpi=300)
-
-                                
-
-    def plot_cmems(cfo,
-                        item,
-                        crns,
-                        dxm,
-                        lon_0,
-                        lat_0,
-                        resolution,
-                        out_path = None):
-        
-        plt.figure(figsize=(40, 20))
-        plt.grid()
-        m = Basemap(
-            lon_0 = lon_0,
-            lat_0 = lat_0,
-            llcrnrlon = crns[0],
-            llcrnrlat = crns[2],
-            urcrnrlon = crns[1],
-            urcrnrlat = crns[3],
-            resolution=resolution)
-        m.drawcoastlines(color='gray',
-                        linewidth=0.5)
-
-        m.fillcontinents(color='gray')
-
-        m.drawparallels(np.arange(crns[2], 
-                                crns[3], 
-                                dxm),
-                        labels=[1,0,0,0],
-                        linewidth=0.5,
-                        color='lightgray',
-                        labelstyle='--')
-        
-        m.drawmeridians(np.arange(crns[0], 
-                                crns[1], 
-                                dxm),
-                        labels=[0,0,0,1],
-                        linewidth=0.5,
-                        color='lightgray',
-                        labelstyle='--')
-        
-        x, y = m(cfo['longitude'], 
-                cfo['latitude'])
-        
-        cs = m.scatter(x,
-                    y,
-                    c=cfo[item],
-                        s=1,
-                        marker='o',
-                        cmap=plt.cm.jet,
-                        vmin=0,vmax=10)
-        
-        cbar = m.colorbar(cs,
-                        location='bottom',
-                        pad="5%")
-        
-        cbar.set_label(f'{item}')
-        if not out_path == None:
-            plt.savefig(out_path, 
-                    dpi=300)
