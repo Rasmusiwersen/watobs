@@ -16,6 +16,7 @@ dependencies = [
     "pandas",
     "requests",
     "matplotlib",
+    "copernicusmarine",
 ]
 
 authors = [
@@ -60,6 +61,7 @@ notebooks = [
   "xarray",
   "netcdf4",
   "NDBC",
+  "basemap",
 ]
 
 [tool.ruff]
