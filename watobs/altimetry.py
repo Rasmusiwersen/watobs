@@ -1,18 +1,20 @@
-from datetime import datetime
-import logging
-import time
-import requests
-import pandas as pd
-import numpy as np
-import matplotlib.pyplot as plt
-import copernicusmarine
-import shutil
-import glob
 import calendar
-import xarray
+import glob
+import logging
 import os
+import shutil
 import tempfile
+import time
+from datetime import datetime
 from pathlib import Path
+from typing import Optional
+
+import copernicusmarine
+import matplotlib.pyplot as plt
+import numpy as np
+import pandas as pd
+import requests
+import xarray
 
 logger = logging.getLogger(__name__)
 
@@ -760,6 +762,22 @@ class CMEMSSatObsRepository:
         self.area = area
 
     @staticmethod
+    def validate_login(
+        username: Optional[str] = None,
+        password: Optional[str] = None,
+        credentials_file: Optional[Path] = None,
+    ):
+        try:
+            _, _ = (
+                copernicusmarine.core_functions.credentials_utils.get_and_check_username_password(
+                    username, password, credentials_file
+                )
+            )
+            return True
+        except copernicusmarine.InvalidUsernameOrPassword:
+            return False
+
+    @staticmethod
     def _parse_datetime(date):
         if date is None:
             return None
@@ -1157,18 +1175,16 @@ class CMEMSSatObsRepository:
         file_path = Path(file_path)
 
         if file_path.is_file():
-            if "cmems_obs-wave_glo_phy-swh" in file_path:
-                f_type = ["file", "cmems_obs-wave_glo_phy-swh"]
+            if file_path.suffix == ".csv":
                 df = self.cmems_wave_csv_to_df(file_path)
 
             elif (
-                "cmems_obs-wind_glo_phy" in file_path
+                file_path.suffix == ".nc" in str(file_path)
             ):  # Maybe this needs to change, right now only wind files are .nc
-                f_type = ["file", "cmems_obs-wind_glo_phy"]
                 df = self.cmems_subset_wind_nc_to_df(file_path)
 
             else:
-                print("Product unknown")
+                raise ValueError("Product unknown")
             df.to_csv(os.path.join(file_path))
             shutil.rmtree(temp_dir)
 
