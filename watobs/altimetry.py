@@ -982,6 +982,9 @@ class CMEMSSatObsRepository:
         data = f[varname].astype(np.float64)
         scale_factor = f[varname].attrs.get("scale_factor", 1.0)
         add_offset = f[varname].attrs.get("add_offset", 0.0)
+        missing_value = f[varname].attrs.get("missing_value", None)
+        if missing_value is not None:
+            data = data.where(data != missing_value, np.nan)
         data = data * scale_factor + add_offset
         data = data.values.astype(np.float64).squeeze()
         return data
