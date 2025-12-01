@@ -16,7 +16,6 @@ dependencies = [
     "pandas",
     "requests",
     "matplotlib",
-    "copernicusmarine",
 ]
 
 authors = [
@@ -36,6 +35,10 @@ classifiers = [
 ]
 
 [project.optional-dependencies]
+cmems = [
+  "copernicusmarine; python_version>='3.9'",
+]
+
 dev = [
   "pytest",
   "ruff",
