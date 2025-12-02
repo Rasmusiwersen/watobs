@@ -16,6 +16,11 @@ import pandas as pd
 import requests
 import xarray
 
+from datetime import datetime
+from dateutil.relativedelta import relativedelta
+import matplotlib.dates as mdates
+from watobs.cmems.utils import get_catalogue_stats
+
 logger = logging.getLogger(__name__)
 
 
@@ -249,7 +254,58 @@ class AltimetryData:
                 print(dfsub.drop(["longitude", "latitude"], axis=1).describe())
 
 
-class DHIAltimetryRepository:
+class _DHISatMixin:
+    def get_observation_stats(self):
+        """Get a summary of the data per satellite missions
+
+        Returns
+        -------
+        pd.DataFrame
+            min and max date and observation count per satellite
+        """
+        raise NotImplementedError("Subclasses must implement get_observation_stats()")
+
+    def plot_observation_stats(self):
+        """Plot graph showing temporal coverage for all satellites
+
+        Examples
+        --------
+        >>> repo.plot_observation_stats()
+        """
+        df = self.get_observation_stats()[["min_date", "max_date"]]
+        df = df.sort_values("min_date", ascending=False)
+
+        nsats = len(df)
+        ysize = max(2.0, 0.45 * nsats)
+        figsize = (10, ysize)
+
+        fig, ax = plt.subplots(figsize=figsize)
+        y = np.repeat(0.0, 2)
+        labels = []
+
+        for row in df.itertuples():
+            y += 1.0
+            plt.plot([row.min_date, row.max_date], y)
+            labels.append(row.Index)
+
+        plt.yticks(np.arange(nsats) + 1, labels)
+
+        end_date = datetime.now() + relativedelta(months=3)
+        end_date = (
+            end_date.replace(day=1) + relativedelta(months=1) - relativedelta(days=1)
+        )
+        yearly = pd.date_range(start="1984-1-1", end=end_date, freq="2AS")
+        plt.xticks(yearly, labels=yearly.year)
+        fmt_year = mdates.YearLocator()
+        ax.xaxis.set_minor_locator(fmt_year)
+        plt.grid(True, which="both")
+        fig.autofmt_xdate()
+        ax.set_xlim([df.min_date.min(), df.max_date.max()])
+        ax.set_title("Satellite lifespan")
+        return ax
+
+
+class DHIAltimetryRepository(_DHISatMixin):
     """Get altimetry observations from DHI
 
     Notes
@@ -751,15 +807,46 @@ class DHIAltimetryRepository:
         return satellite_strings
 
 
-class CMEMSSatObsRepository:
+class CMEMSSatObsRepository(_DHISatMixin):
     # To be done:
     # - Merge the four functions that converts CMEMS to df. Especially the .nc reading can be condensed.
 
-    def __init__(self, dataset_id=None, start_time=None, end_time=None, area=None):
+    def __init__(
+        self,
+        product_id: str | None = None,
+        dataset_id=None,
+        start_time=None,
+        end_time=None,
+        area=None,
+    ):
+        self._validate_set_product_id(product_id)
         self.dataset_id = dataset_id
         self.start_time = start_time
         self.end_time = end_time
         self.area = area
+
+    def _validate_set_product_id(self, product_id):
+        product_id_options = [
+            "WAVE_GLO_PHY_SWH_L3_MY_014_005",  # 'GLOBAL OCEAN L4 SIGNIFICANT WAVE HEIGHT FROM REPROCESSED SATELLITE MEASUREMENTS
+            "WAVE_GLO_PHY_SWH_L3_NRT_014_001",  # 'GLOBAL OCEAN L3 SIGNIFICANT WAVE HEIGHT FROM NEAR REAL TIME SATELLITE MEASUREMENTS
+            "WIND_GLO_PHY_L3_MY_012_005",  # 'GLOBAL OCEAN L4 WIND FROM REPROCESSED SATELLITE MEASUREMENTS
+            "WIND_GLO_PHY_L3_NRT_012_002",
+        ]
+
+        if product_id is not None:
+            if product_id not in product_id_options:
+                raise Exception(
+                    f"Invalid product id {product_id}! Must be one of {product_id_options}"
+                )
+            self.product_id = product_id
+        else:
+            raise Exception("Product id must be specified!")
+
+        print(f"Loading CMEMS product id: {self.product_id}")
+        self.catalogue = copernicusmarine.describe(
+            product_id=product_id, disable_progress_bar=True
+        )
+        print("\tDone!")
 
     @staticmethod
     def validate_login(
@@ -822,7 +909,19 @@ class CMEMSSatObsRepository:
             dd[key] = val
         return dd
 
-    def download_copernicus_data(
+    def get_satobs_data(
+        self, dataset_id=None, start_time=None, end_time=None, area=None
+    ):
+        """Main function that retrieves data from CMEMS through api requests"""
+
+        temp_dir, file_path = self._download_copernicus_data(
+            dataset_id, start_time, end_time, area
+        )
+
+        df = self._cmems_format_raw_data(temp_dir, file_path)
+        return df
+
+    def _download_copernicus_data(
         self, dataset_id=None, start_time=None, end_time=None, area=None
     ):
         """Main function that retrieves data from CMEMS through api requests
@@ -971,12 +1070,13 @@ class CMEMSSatObsRepository:
         downloaded = after - before
         if len(downloaded) == 1:
             file_path = temp_dir / list(downloaded)[0]
-        else:
+        elif len(downloaded) > 1:
             logger.warning("Multiple files downloaded, using directory path")
             file_path = temp_dir
+        elif len(downloaded) == 0:
+            raise FileNotFoundError("No files were downloaded from CMEMS.")
 
-        df = self.cmems_format_raw_data(temp_dir, file_path)
-        return df
+        return temp_dir, file_path
 
     def get_var_float64(self, f, varname):
         data = f[varname].astype(np.float64)
@@ -1173,7 +1273,7 @@ class CMEMSSatObsRepository:
         df = df.rename(columns={"VAVH": "SWH", "VAVH_UNFILTERED": "SWH_UNFILTERED"})
         return df
 
-    def cmems_format_raw_data(self, temp_dir, file_path):
+    def _cmems_format_raw_data(self, temp_dir, file_path):
         temp_dir = Path(temp_dir)
         file_path = Path(file_path)
 
@@ -1183,8 +1283,15 @@ class CMEMSSatObsRepository:
 
             elif (
                 file_path.suffix == ".nc" in str(file_path)
+                and "wind" in str(file_path).lower()
             ):  # Maybe this needs to change, right now only wind files are .nc
                 df = self.cmems_subset_wind_nc_to_df(file_path)
+
+            elif (
+                file_path.suffix == ".nc" in str(file_path)
+                and "swh" in str(file_path).lower()
+            ):  # Maybe this needs to change, right now only wind files are .nc
+                df = self.cmems_glo_wave_to_df(file_path)
 
             else:
                 raise ValueError("Product unknown")
@@ -1234,4 +1341,16 @@ class CMEMSSatObsRepository:
                                 logger.debug(f"Reading {file.name}")
                     df = pd.concat([df, cfo], axis=0)
             shutil.rmtree(temp_dir)
+        return df
+
+    def get_observation_stats(self):
+        dct_coverage = get_catalogue_stats(self.catalogue)
+        df = pd.DataFrame.from_dict(
+            dct_coverage, orient="index", columns=["min_date", "max_date"]
+        )
+        # df = df.reset_index()
+        # df = df.set_index(['short_name', 'my_or_nrt'])
+        df.index = pd.MultiIndex.from_tuples(df.index, names=["short_name", "archive"])
+        df["min_date"] = pd.to_datetime(df["min_date"], format="ISO8601")
+        df["max_date"] = pd.to_datetime(df["max_date"], format="ISO8601")
         return df
