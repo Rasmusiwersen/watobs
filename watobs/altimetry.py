@@ -19,7 +19,7 @@ import xarray
 from datetime import datetime
 from dateutil.relativedelta import relativedelta
 import matplotlib.dates as mdates
-from watobs.cmems.utils import get_catalogue_stats
+from watobs.cmems.utils import get_catalogue_info
 
 logger = logging.getLogger(__name__)
 
@@ -914,12 +914,49 @@ class CMEMSSatObsRepository(_DHISatMixin):
     ):
         """Main function that retrieves data from CMEMS through api requests"""
 
-        temp_dir, file_path = self._download_copernicus_data(
-            dataset_id, start_time, end_time, area
-        )
+        def download_2_df(dataset_id, start_time, end_time, area):
+            # Sub-function to download and convert to dataframe
+            temp_dir, file_path = self._download_copernicus_data(
+                dataset_id, start_time, end_time, area
+            )
 
-        df = self._cmems_format_raw_data(temp_dir, file_path)
-        return df
+            # If download is successful, convert to dataframe... else emtpy
+            if temp_dir is not None and file_path is not None:
+                df = self._cmems_format_raw_data(temp_dir, file_path)
+                return df.dropna()
+            else:
+                return None
+
+        # For single case
+        if dataset_id is not None:
+            df = download_2_df(dataset_id, start_time, end_time, area)
+            return df
+        # For multiple datasets at once
+        else:
+            df_lst = []
+            if hasattr(self, "catalogue"):
+                dataset_ids = list(self.datasets.dataset_id.values)
+
+                for i, dataset_id in enumerate(dataset_ids):
+                    print(
+                        f"Downloading dataset {i+1} of {len(dataset_ids)}: {dataset_id}"
+                    )
+                    ## Download data
+                    df = download_2_df(dataset_id, start_time, end_time, area)
+                    if df is None:
+                        continue
+                    ## Add meta data
+                    dataset_meta = self.datasets.loc[dataset_id]
+                    df["satellite"] = (
+                        dataset_meta.short_name + "-" + dataset_meta.asc_desc
+                    )
+                    df_lst.append(df)
+
+                df = pd.concat(df_lst)
+                df = df.dropna()
+                return df
+            else:
+                raise Exception("No dataset id specified and no catalogue available!")
 
     def _download_copernicus_data(
         self, dataset_id=None, start_time=None, end_time=None, area=None
@@ -1074,7 +1111,8 @@ class CMEMSSatObsRepository(_DHISatMixin):
             logger.warning("Multiple files downloaded, using directory path")
             file_path = temp_dir
         elif len(downloaded) == 0:
-            raise FileNotFoundError("No files were downloaded from CMEMS.")
+            logger.warning("Empty download, no files found")
+            return None, None
 
         return temp_dir, file_path
 
@@ -1344,13 +1382,34 @@ class CMEMSSatObsRepository(_DHISatMixin):
         return df
 
     def get_observation_stats(self):
-        dct_coverage = get_catalogue_stats(self.catalogue)
-        df = pd.DataFrame.from_dict(
-            dct_coverage, orient="index", columns=["min_date", "max_date"]
+        df = (
+            self.datasets.groupby("short_name").first().loc[:, ["min_date", "max_date"]]
         )
-        # df = df.reset_index()
-        # df = df.set_index(['short_name', 'my_or_nrt'])
-        df.index = pd.MultiIndex.from_tuples(df.index, names=["short_name", "archive"])
-        df["min_date"] = pd.to_datetime(df["min_date"], format="ISO8601")
-        df["max_date"] = pd.to_datetime(df["max_date"], format="ISO8601")
         return df
+
+    @property
+    def datasets(self):
+        df = get_catalogue_info(self.catalogue)
+
+        if "asc_desc" in df.columns:
+            keys = ["short_name", "asc_desc"]
+        else:
+            keys = ["short_name"]
+
+        # For now, just get highest resolution
+        if "spatial_resolution" not in df.columns:
+            return df
+        else:
+            if len(df["spatial_resolution"].dropna()) == 0:
+                return df
+            df_tmp = df.copy()
+            df_tmp["spatial_resolution"] = [
+                float(res.split("deg")[0]) for res in df["spatial_resolution"]
+            ]
+            idx = df_tmp.groupby(keys)["spatial_resolution"].idxmin()
+            df = df.loc[idx]
+            return df
+
+    @property
+    def dataset_ids(self):
+        return list(self.datasets.index.values)

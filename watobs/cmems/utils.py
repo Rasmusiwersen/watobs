@@ -3,6 +3,7 @@
 from datetime import datetime, timezone
 from typing import Any, Optional, Tuple
 import re
+import pandas as pd
 import copernicusmarine
 
 
@@ -125,8 +126,6 @@ def print_time_coverage(
 
 
 def parse_dataset_id(dataset):
-    import re
-
     name_list = re.split("_|-", dataset.dataset_id)
 
     source = name_list[0]
@@ -139,14 +138,20 @@ def parse_dataset_id(dataset):
         multiyear_or_nearrealtime = name_list[6]
         short_name = name_list[7]
         processing_level = name_list[8]
+        asc_desc = None
         spatial_resolution = None
         temporal_resolution = name_list[9]
-        temporal_type = name_list[10]
+        if len(name_list) > 10:  # some datasets have temporal type
+            temporal_type = name_list[10]
+        else:
+            temporal_type = None
     elif obs_type == "wind":
         param = None
         multiyear_or_nearrealtime = name_list[5]
         processing_level = name_list[6]
         short_name = name_list[7]
+        # orbit_type = name_list[8]
+        asc_desc = name_list[9]
         spatial_resolution = name_list[10]
         temporal_resolution = name_list[11]
         temporal_type = name_list[12]
@@ -161,6 +166,7 @@ def parse_dataset_id(dataset):
         "multiyear_or_nearrealtime": multiyear_or_nearrealtime,
         "short_name": short_name,
         "processing_level": processing_level,
+        "asc_desc": asc_desc,
         "spatial_resolution": spatial_resolution,
         "temporal_resolution": temporal_resolution,
         "temporal_type": temporal_type,
@@ -174,7 +180,7 @@ def parse_datetime(time_coord_value):
     return datetime.fromtimestamp(time_sec, tz=timezone.utc)
 
 
-def get_catalogue_stats(catalogue) -> dict:
+def get_catalogue_info(catalogue) -> dict:
     """Get CMEMS catalogue stats for altimetry and winds datasets."""
     dct_coverage = {}
 
@@ -185,21 +191,24 @@ def get_catalogue_stats(catalogue) -> dict:
                     time_coord = find_time_coordinate(part)
                     name_dict = parse_dataset_id(dataset)
 
-                    if name_dict["obs_type"] not in ["wave", "wind"]:
-                        continue
+                    # if name_dict["obs_type"] not in ["wave", "wind"]:
+                    #     continue
 
                     # Not interested in level other than L3
-                    if name_dict["processing_level"] != "l3":
-                        continue
+                    # if name_dict["processing_level"] != "l3":
+                    #     continue
 
-                    key = (
-                        name_dict["short_name"],
-                        name_dict["multiyear_or_nearrealtime"],
+                    # key = dataset.dataset_id
+
+                    dct_coverage[dataset.dataset_id] = name_dict
+                    dct_coverage[dataset.dataset_id]["min_date"] = parse_datetime(
+                        time_coord.minimum_value
+                    )
+                    dct_coverage[dataset.dataset_id]["max_date"] = parse_datetime(
+                        time_coord.maximum_value
                     )
 
-                    dct_coverage[key] = {
-                        "min_date": parse_datetime(time_coord.minimum_value),
-                        "max_date": parse_datetime(time_coord.maximum_value),
-                    }
+    df_coverage = pd.DataFrame.from_dict(dct_coverage, orient="index")
+    df_coverage.index.name = "dataset_id"
 
-    return dct_coverage
+    return df_coverage
