@@ -935,7 +935,7 @@ class CMEMSSatObsRepository(_DHISatMixin):
         else:
             df_lst = []
             if hasattr(self, "catalogue"):
-                dataset_ids = list(self.datasets.dataset_id.values)
+                dataset_ids = list(self.dataset_ids)
 
                 for i, dataset_id in enumerate(dataset_ids):
                     print(
@@ -947,9 +947,10 @@ class CMEMSSatObsRepository(_DHISatMixin):
                         continue
                     ## Add meta data
                     dataset_meta = self.datasets.loc[dataset_id]
-                    df["satellite"] = (
-                        dataset_meta.short_name + "-" + dataset_meta.asc_desc
-                    )
+                    meta_satellite = dataset_meta.short_name
+                    if dataset_meta.asc_desc is not None:  # Waves do not incl asc/desc
+                        meta_satellite += "-" + dataset_meta.asc_desc
+                    df["satellite"] = meta_satellite
                     df_lst.append(df)
 
                 df = pd.concat(df_lst)
