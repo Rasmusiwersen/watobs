@@ -304,6 +304,53 @@ class _DHISatMixin:
         ax.set_title("Satellite lifespan")
         return ax
 
+    def _validate_area(self, area):
+        # polygon=6.811,54.993,8.009,54.993,8.009,57.154,6.811,57.154,6.811,54.993
+        # bbox=115.0,28.5,150.2,52.1
+        # lon=10.9&lat=55.9&radius=10.0
+        parsed = False
+        message = None
+        if area[0:5] == "bbox=":
+            if area.count(",") == 3:
+                parsed = True
+            else:
+                message = "bbox area should be provided as bbox=115.0,28.5,150.2,52.1"
+
+        elif area[0:8] == "polygon=":
+            if area.count(",") >= 5:
+                parsed = True
+            else:
+                message = "polygon area should be provided as polygon=6.811,54.993,8.009,54.993,8.009,57.154,6.811,57.154,6.811,54.993"
+
+        elif area[0:4] == "lon=":
+            if (area.count("&lat=") == 1) & (area.count("&radius=") == 1):
+                parsed = True
+            else:
+                message = (
+                    "circle area should be provided as lon=10.9&lat=55.9&radius=10.0"
+                )
+        else:
+            message = "area must be given as bbox=115.0,28.5,150.2,52.1 or polygon=6.811,54.993,8.009,54.993,8.009,57.154,6.811,57.154,6.811,54.993 or lon=10.9&lat=55.9&radius=10.0"
+
+        if not parsed:
+            raise Exception(f"Failed to parse area {area}! {message}")
+        return self._area_str_to_dict(area)
+
+    @staticmethod
+    def _parse_datetime(date: str | None, utc=None) -> pd.Timestamp | None:
+        if date is None:
+            return None
+
+        return pd.to_datetime(date, format="ISO8601", utc=utc)
+
+    @staticmethod
+    def _area_str_to_dict(area):
+        dd = {}
+        for token in area.split("&"):
+            key, val = token.split("=")
+            dd[key] = val
+        return dd
+
 
 class DHIAltimetryRepository(_DHISatMixin):
     """Get altimetry observations from DHI
@@ -664,54 +711,6 @@ class DHIAltimetryRepository(_DHISatMixin):
             d["numeric"] = numeric
         return d
 
-    def _validate_area(self, area):
-        # polygon=6.811,54.993,8.009,54.993,8.009,57.154,6.811,57.154,6.811,54.993
-        # bbox=115.0,28.5,150.2,52.1
-        # lon=10.9&lat=55.9&radius=10.0
-        parsed = False
-        message = None
-
-        if area[0:5] == "bbox=":
-            if area.count(",") == 3:
-                parsed = True
-            else:
-                message = "bbox area should be provided as bbox=115.0,28.5,150.2,52.1"
-
-        elif area[0:8] == "polygon=":
-            if area.count(",") >= 5:
-                parsed = True
-            else:
-                message = "polygon area should be provided as polygon=6.811,54.993,8.009,54.993,8.009,57.154,6.811,57.154,6.811,54.993"
-
-        elif area[0:4] == "lon=":
-            if (area.count("&lat=") == 1) & (area.count("&radius=") == 1):
-                parsed = True
-            else:
-                message = (
-                    "circle area should be provided as lon=10.9&lat=55.9&radius=10.0"
-                )
-        else:
-            message = "area must be given as bbox=115.0,28.5,150.2,52.1 or polygon=6.811,54.993,8.009,54.993,8.009,57.154,6.811,57.154,6.811,54.993 or lon=10.9&lat=55.9&radius=10.0"
-
-        if not parsed:
-            raise Exception(f"Failed to parse area {area}! {message}")
-        return self._area_str_to_dict(area)
-
-    @staticmethod
-    def _area_str_to_dict(area):
-        dd = {}
-        for token in area.split("&"):
-            key, val = token.split("=")
-            dd[key] = val
-        return dd
-
-    @staticmethod
-    def _parse_datetime(date):
-        if date is None:
-            return None
-
-        return pd.to_datetime(date, format="ISO8601")
-
     def get_altimetry_data_raw(self, payload: dict) -> pd.DataFrame:
         """Request data from altimetry api
 
@@ -813,40 +812,36 @@ class CMEMSSatObsRepository(_DHISatMixin):
 
     def __init__(
         self,
+        *,
         product_id: str | None = None,
-        dataset_id=None,
+        dataset_id: str | None = None,
         start_time=None,
         end_time=None,
         area=None,
     ):
-        self._validate_set_product_id(product_id)
-        self.dataset_id = dataset_id
+        self._validate_set_product_id(product_id, dataset_id)
         self.start_time = start_time
         self.end_time = end_time
         self.area = area
 
-    def _validate_set_product_id(self, product_id):
-        product_id_options = [
-            "WAVE_GLO_PHY_SWH_L3_MY_014_005",  # 'GLOBAL OCEAN L4 SIGNIFICANT WAVE HEIGHT FROM REPROCESSED SATELLITE MEASUREMENTS
-            "WAVE_GLO_PHY_SWH_L3_NRT_014_001",  # 'GLOBAL OCEAN L3 SIGNIFICANT WAVE HEIGHT FROM NEAR REAL TIME SATELLITE MEASUREMENTS
-            "WIND_GLO_PHY_L3_MY_012_005",  # 'GLOBAL OCEAN L4 WIND FROM REPROCESSED SATELLITE MEASUREMENTS
-            "WIND_GLO_PHY_L3_NRT_012_002",
-        ]
+    def _validate_set_product_id(
+        self, product_id: str | None, dataset_id: str | None = None
+    ):
+        if product_id is None and dataset_id is None:
+            raise ValueError("Either product_id or dataset_id must be provided!")
 
         if product_id is not None:
-            if product_id not in product_id_options:
-                raise Exception(
-                    f"Invalid product id {product_id}! Must be one of {product_id_options}"
-                )
-            self.product_id = product_id
-        else:
-            raise Exception("Product id must be specified!")
-
-        print(f"Loading CMEMS product id: {self.product_id}")
-        self.catalogue = copernicusmarine.describe(
-            product_id=product_id, disable_progress_bar=True
-        )
-        print("\tDone!")
+            print(f"Loading CMEMS product id: {product_id}")
+            self.catalogue = copernicusmarine.describe(
+                product_id=product_id, disable_progress_bar=True
+            )
+            print("\tDone!")
+        elif dataset_id is not None:
+            print(f"Loading CMEMS dataset id: {dataset_id}")
+            self.catalogue = copernicusmarine.describe(
+                dataset_id=dataset_id, disable_progress_bar=True
+            )
+            print("\tDone!")
 
     @staticmethod
     def validate_login(
@@ -864,103 +859,80 @@ class CMEMSSatObsRepository(_DHISatMixin):
         except copernicusmarine.InvalidUsernameOrPassword:
             return False
 
-    @staticmethod
-    def _parse_datetime(date):
-        if date is None:
-            return None
-        return pd.to_datetime(date, format="ISO8601")
-
-    def _validate_area(self, area):
-        # polygon=6.811,54.993,8.009,54.993,8.009,57.154,6.811,57.154,6.811,54.993
-        # bbox=115.0,28.5,150.2,52.1
-        # lon=10.9&lat=55.9&radius=10.0
-        parsed = False
-        message = None
-        if area[0:5] == "bbox=":
-            if area.count(",") == 3:
-                parsed = True
-            else:
-                message = "bbox area should be provided as bbox=115.0,28.5,150.2,52.1"
-
-        elif area[0:8] == "polygon=":
-            if area.count(",") >= 5:
-                parsed = True
-            else:
-                message = "polygon area should be provided as polygon=6.811,54.993,8.009,54.993,8.009,57.154,6.811,57.154,6.811,54.993"
-
-        elif area[0:4] == "lon=":
-            if (area.count("&lat=") == 1) & (area.count("&radius=") == 1):
-                parsed = True
-            else:
-                message = (
-                    "circle area should be provided as lon=10.9&lat=55.9&radius=10.0"
-                )
-        else:
-            message = "area must be given as bbox=115.0,28.5,150.2,52.1 or polygon=6.811,54.993,8.009,54.993,8.009,57.154,6.811,57.154,6.811,54.993 or lon=10.9&lat=55.9&radius=10.0"
-
-        if not parsed:
-            raise Exception(f"Failed to parse area {area}! {message}")
-        return self._area_str_to_dict(area)
-
-    def _area_str_to_dict(self, area):
-        dd = {}
-        for token in area.split("&"):
-            key, val = token.split("=")
-            dd[key] = val
-        return dd
-
-    def get_satobs_data(
-        self, dataset_id=None, start_time=None, end_time=None, area=None
-    ):
+    def get_satobs_data(self, start_time=None, end_time=None, area=None):
         """Main function that retrieves data from CMEMS through api requests"""
 
-        def download_2_df(dataset_id, start_time, end_time, area):
+        tmpdir = tempfile.TemporaryDirectory(prefix=".cmems_", dir=os.getcwd())
+
+        def download_2_df(dataset_id, start_time, end_time, area, tmpdir):
+            # Validate start/end time
+            start_time_ = self._parse_datetime(start_time, utc=True)
+            end_time_ = self._parse_datetime(end_time, utc=True)
+
+            dataset_meta = self.datasets.loc[dataset_id]
+            if end_time_ < dataset_meta.min_date:
+                print(
+                    "Warning: end_time is before the dataset's minimum date; no data."
+                )
+                return None
+            if start_time_ > dataset_meta.max_date:
+                print(
+                    "Warning: start_time is after the dataset's maximum date; no data."
+                )
+                return None
+            if not start_time_ >= dataset_meta.min_date:
+                print("Warning: start_time is before the dataset's minimum date.")
+                start_time = dataset_meta.min_date.tz_convert(None)
+            if not end_time_ <= dataset_meta.max_date:
+                print("Warning: end_time is after the dataset's maximum date.")
+                end_time = dataset_meta.max_date.tz_convert(None)
             # Sub-function to download and convert to dataframe
             temp_dir, file_path = self._download_copernicus_data(
-                dataset_id, start_time, end_time, area
+                dataset_id, start_time, end_time, area, tmpdir
             )
 
             # If download is successful, convert to dataframe... else emtpy
             if temp_dir is not None and file_path is not None:
                 df = self._cmems_format_raw_data(temp_dir, file_path)
                 return df.dropna()
+
             else:
                 return None
 
-        # For single case
-        if dataset_id is not None:
-            df = download_2_df(dataset_id, start_time, end_time, area)
-            return df
-        # For multiple datasets at once
-        else:
+        try:
+            # For multiple datasets at once
             df_lst = []
-            if hasattr(self, "catalogue"):
-                dataset_ids = list(self.dataset_ids)
 
-                for i, dataset_id in enumerate(dataset_ids):
-                    print(
-                        f"Downloading dataset {i+1} of {len(dataset_ids)}: {dataset_id}"
-                    )
-                    ## Download data
-                    df = download_2_df(dataset_id, start_time, end_time, area)
-                    if df is None:
-                        continue
-                    ## Add meta data
-                    dataset_meta = self.datasets.loc[dataset_id]
-                    meta_satellite = dataset_meta.short_name
-                    if dataset_meta.asc_desc is not None:  # Waves do not incl asc/desc
-                        meta_satellite += "-" + dataset_meta.asc_desc
-                    df["satellite"] = meta_satellite
-                    df_lst.append(df)
+            dataset_ids = list(self.dataset_ids)
 
-                df = pd.concat(df_lst)
-                df = df.dropna()
-                return df
-            else:
-                raise Exception("No dataset id specified and no catalogue available!")
+            for i, dataset_id in enumerate(dataset_ids):
+                print(f"Downloading dataset {i+1} of {len(dataset_ids)}: {dataset_id}")
+                ## Download data
+                df = download_2_df(dataset_id, start_time, end_time, area, tmpdir)
+                if df is None:
+                    continue
+                ## Add meta data
+                dataset_meta = self.datasets.loc[dataset_id]
+                meta_satellite = dataset_meta.short_name
+                if dataset_meta.asc_desc is not None:  # Waves do not incl asc/desc
+                    meta_satellite += "-" + dataset_meta.asc_desc
+                df["satellite"] = meta_satellite
+                df_lst.append(df)
+
+            df = pd.concat(df_lst)
+            df = df.dropna()
+
+            tmpdir.cleanup()
+
+            # Finally, convert to AltimetryData object
+            return AltimetryData(df, area=area)
+        except Exception as e:
+            print(f"Error obtaining data! {e}")
+            tmpdir.cleanup()
+            return None
 
     def _download_copernicus_data(
-        self, dataset_id=None, start_time=None, end_time=None, area=None
+        self, dataset_id=None, start_time=None, end_time=None, area=None, tmpdir=None
     ):
         """Main function that retrieves data from CMEMS through api requests
 
@@ -1017,17 +989,14 @@ class CMEMSSatObsRepository(_DHISatMixin):
                 f"end time '{end_time}' must be greater than start time '{start_time}'!"
             )
 
-        start_year = d["start_date"][0:4]
-        end_year = d["end_date"][0:4]
-        start_month = d["start_date"][4:6]
-        end_month = d["end_date"][4:6]
-        start_day = d["start_date"][6:8]
-        end_day = d["end_date"][6:8]
-
         strt_tm = pd.to_datetime(
-            f"{start_year}-{start_month}-{start_day}", format="ISO8601"
+            f"{start_time.year:04d}-{start_time.month:02d}-{start_time.day:02d}",
+            format="ISO8601",
         )
-        end_tm = pd.to_datetime(f"{end_year}-{end_month}-{end_day}", format="ISO8601")
+        end_tm = pd.to_datetime(
+            f"{end_time.year:04d}-{end_time.month:02d}-{end_time.day:02d}",
+            format="ISO8601",
+        )
 
         # Handle area parsing
         global_flag = True
@@ -1048,7 +1017,7 @@ class CMEMSSatObsRepository(_DHISatMixin):
                 raise ValueError(f"Invalid bbox coordinates: {e}")
 
         # Create a temporary directory
-        temp_dir = Path(tempfile.mkdtemp(prefix="cmems_", dir=os.getcwd()))
+        temp_dir = Path(tmpdir.name)
         before = set(os.listdir(temp_dir))
 
         # Download logic
@@ -1313,6 +1282,7 @@ class CMEMSSatObsRepository(_DHISatMixin):
         return df
 
     def _cmems_format_raw_data(self, temp_dir, file_path):
+        print("Formatting data to DataFrame...")
         temp_dir = Path(temp_dir)
         file_path = Path(file_path)
 
@@ -1335,7 +1305,6 @@ class CMEMSSatObsRepository(_DHISatMixin):
             else:
                 raise ValueError("Product unknown")
             df.to_csv(os.path.join(file_path))
-            shutil.rmtree(temp_dir)
 
         else:
             for ds in os.listdir(file_path):
@@ -1379,7 +1348,8 @@ class CMEMSSatObsRepository(_DHISatMixin):
                                 cfo = pd.concat([cfo, sing_df], axis=0)
                                 logger.debug(f"Reading {file.name}")
                     df = pd.concat([df, cfo], axis=0)
-            shutil.rmtree(temp_dir)
+
+        print("\tDone!")
         return df
 
     def get_observation_stats(self):
