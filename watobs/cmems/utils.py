@@ -66,6 +66,10 @@ def find_time_coordinate(part) -> Any:
     """
     coordinates = part.get_coordinates()
 
+    if len(coordinates) == 0:
+        print(f"No time coordinates found in part {part.name!r}.")
+        return None
+
     for coord_id, (coord_obj, _var_ids, _svc_names) in coordinates.items():
         is_time_axis = (
             getattr(coord_obj, "axis", None) == "t"
@@ -201,12 +205,16 @@ def get_catalogue_info(catalogue) -> dict:
                     # key = dataset.dataset_id
 
                     dct_coverage[dataset.dataset_id] = name_dict
-                    dct_coverage[dataset.dataset_id]["min_date"] = parse_datetime(
-                        time_coord.minimum_value
-                    )
-                    dct_coverage[dataset.dataset_id]["max_date"] = parse_datetime(
-                        time_coord.maximum_value
-                    )
+                    if time_coord is not None:
+                        dct_coverage[dataset.dataset_id]["min_date"] = parse_datetime(
+                            time_coord.minimum_value
+                        )
+                        dct_coverage[dataset.dataset_id]["max_date"] = parse_datetime(
+                            time_coord.maximum_value
+                        )
+                    else:
+                        dct_coverage[dataset.dataset_id]["min_date"] = None
+                        dct_coverage[dataset.dataset_id]["max_date"] = None
 
     df_coverage = pd.DataFrame.from_dict(dct_coverage, orient="index")
     df_coverage.index.name = "dataset_id"
