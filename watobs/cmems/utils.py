@@ -65,7 +65,7 @@ def find_time_coordinate(part) -> Any:
     Raises RuntimeError if no such coordinate is found.
     """
     coordinates = part.get_coordinates()
-
+    print(coordinates)
     for coord_id, (coord_obj, _var_ids, _svc_names) in coordinates.items():
         is_time_axis = (
             getattr(coord_obj, "axis", None) == "t"
@@ -188,7 +188,9 @@ def get_catalogue_info(catalogue) -> dict:
         for dataset in product.datasets:
             for version in dataset.versions:
                 for part in version.parts:
+                    print(part)
                     time_coord = find_time_coordinate(part)
+                    print(time_coord)
                     name_dict = parse_dataset_id(dataset)
 
                     # if name_dict["obs_type"] not in ["wave", "wind"]:
