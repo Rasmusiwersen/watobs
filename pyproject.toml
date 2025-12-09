@@ -35,6 +35,10 @@ classifiers = [
 ]
 
 [project.optional-dependencies]
+cmems = [
+  "copernicusmarine; python_version>='3.9'",
+]
+
 dev = [
   "pytest",
   "ruff",
@@ -60,6 +64,7 @@ notebooks = [
   "xarray",
   "netcdf4",
   "NDBC",
+  "basemap",
 ]
 
 [tool.ruff]

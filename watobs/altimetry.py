@@ -1,9 +1,27 @@
-from datetime import datetime
+import calendar
+import glob
+import logging
+import os
+import shutil
+import tempfile
 import time
-import requests
-import pandas as pd
-import numpy as np
+from datetime import datetime
+from pathlib import Path
+from typing import Optional
+
+import copernicusmarine
 import matplotlib.pyplot as plt
+import numpy as np
+import pandas as pd
+import requests
+import xarray
+
+from datetime import datetime
+from dateutil.relativedelta import relativedelta
+import matplotlib.dates as mdates
+from watobs.cmems.utils import get_catalogue_info
+
+logger = logging.getLogger(__name__)
 
 
 class APIAuthenticationFailed(Exception):
@@ -236,7 +254,105 @@ class AltimetryData:
                 print(dfsub.drop(["longitude", "latitude"], axis=1).describe())
 
 
-class DHIAltimetryRepository:
+class _DHISatMixin:
+    def get_observation_stats(self):
+        """Get a summary of the data per satellite missions
+
+        Returns
+        -------
+        pd.DataFrame
+            min and max date and observation count per satellite
+        """
+        raise NotImplementedError("Subclasses must implement get_observation_stats()")
+
+    def plot_observation_stats(self):
+        """Plot graph showing temporal coverage for all satellites
+
+        Examples
+        --------
+        >>> repo.plot_observation_stats()
+        """
+        df = self.get_observation_stats()[["min_date", "max_date"]]
+        df = df.sort_values("min_date", ascending=False)
+
+        nsats = len(df)
+        ysize = max(2.0, 0.45 * nsats)
+        figsize = (10, ysize)
+
+        fig, ax = plt.subplots(figsize=figsize)
+        y = np.repeat(0.0, 2)
+        labels = []
+
+        for row in df.itertuples():
+            y += 1.0
+            plt.plot([row.min_date, row.max_date], y)
+            labels.append(row.Index)
+
+        plt.yticks(np.arange(nsats) + 1, labels)
+
+        end_date = datetime.now() + relativedelta(months=3)
+        end_date = (
+            end_date.replace(day=1) + relativedelta(months=1) - relativedelta(days=1)
+        )
+        yearly = pd.date_range(start="1984-1-1", end=end_date, freq="2AS")
+        plt.xticks(yearly, labels=yearly.year)
+        fmt_year = mdates.YearLocator()
+        ax.xaxis.set_minor_locator(fmt_year)
+        plt.grid(True, which="both")
+        fig.autofmt_xdate()
+        ax.set_xlim([df.min_date.min(), df.max_date.max()])
+        ax.set_title("Satellite lifespan")
+        return ax
+
+    def _validate_area(self, area):
+        # polygon=6.811,54.993,8.009,54.993,8.009,57.154,6.811,57.154,6.811,54.993
+        # bbox=115.0,28.5,150.2,52.1
+        # lon=10.9&lat=55.9&radius=10.0
+        parsed = False
+        message = None
+        if area[0:5] == "bbox=":
+            if area.count(",") == 3:
+                parsed = True
+            else:
+                message = "bbox area should be provided as bbox=115.0,28.5,150.2,52.1"
+
+        elif area[0:8] == "polygon=":
+            if area.count(",") >= 5:
+                parsed = True
+            else:
+                message = "polygon area should be provided as polygon=6.811,54.993,8.009,54.993,8.009,57.154,6.811,57.154,6.811,54.993"
+
+        elif area[0:4] == "lon=":
+            if (area.count("&lat=") == 1) & (area.count("&radius=") == 1):
+                parsed = True
+            else:
+                message = (
+                    "circle area should be provided as lon=10.9&lat=55.9&radius=10.0"
+                )
+        else:
+            message = "area must be given as bbox=115.0,28.5,150.2,52.1 or polygon=6.811,54.993,8.009,54.993,8.009,57.154,6.811,57.154,6.811,54.993 or lon=10.9&lat=55.9&radius=10.0"
+
+        if not parsed:
+            raise Exception(f"Failed to parse area {area}! {message}")
+        return self._area_str_to_dict(area)
+
+    @staticmethod
+    def _parse_datetime(date: str | None, utc=None) -> pd.Timestamp | None:
+        if date is None:
+            return None
+
+        return pd.to_datetime(date, format="ISO8601", utc=utc)
+
+    @staticmethod
+    def _area_str_to_dict(area):
+        dd = {}
+        for token in area.split("&"):
+            key, val = token.split("=")
+            dd[key] = val
+        return dd
+
+
+class DHIAltimetryRepository(_DHISatMixin):
     """Get altimetry observations from DHI
 
     Notes
@@ -595,54 +711,6 @@ class DHIAltimetryRepository:
             d["numeric"] = numeric
         return d
 
-    def _validate_area(self, area):
-        # polygon=6.811,54.993,8.009,54.993,8.009,57.154,6.811,57.154,6.811,54.993
-        # bbox=115.0,28.5,150.2,52.1
-        # lon=10.9&lat=55.9&radius=10.0
-        parsed = False
-        message = None
-
-        if area[0:5] == "bbox=":
-            if area.count(",") == 3:
-                parsed = True
-            else:
-                message = "bbox area should be provided as bbox=115.0,28.5,150.2,52.1"
-
-        elif area[0:8] == "polygon=":
-            if area.count(",") >= 5:
-                parsed = True
-            else:
-                message = "polygon area should be provided as polygon=6.811,54.993,8.009,54.993,8.009,57.154,6.811,57.154,6.811,54.993"
-
-        elif area[0:4] == "lon=":
-            if (area.count("&lat=") == 1) & (area.count("&radius=") == 1):
-                parsed = True
-            else:
-                message = (
-                    "circle area should be provided as lon=10.9&lat=55.9&radius=10.0"
-                )
-        else:
-            message = "area must be given as bbox=115.0,28.5,150.2,52.1 or polygon=6.811,54.993,8.009,54.993,8.009,57.154,6.811,57.154,6.811,54.993 or lon=10.9&lat=55.9&radius=10.0"
-
-        if not parsed:
-            raise Exception(f"Failed to parse area {area}! {message}")
-        return self._area_str_to_dict(area)
-
-    @staticmethod
-    def _area_str_to_dict(area):
-        dd = {}
-        for token in area.split("&"):
-            key, val = token.split("=")
-            dd[key] = val
-        return dd
-
-    @staticmethod
-    def _parse_datetime(date):
-        if date is None:
-            return None
-
-        return pd.to_datetime(date, format="ISO8601")
-
     def get_altimetry_data_raw(self, payload: dict) -> pd.DataFrame:
         """Request data from altimetry api
 
@@ -736,3 +804,654 @@ class DHIAltimetryRepository:
             else:
                 raise InvalidSatelliteName("Invalid satellite name: " + sat)
         return satellite_strings
+
+
+class CMEMSSatObsRepository(_DHISatMixin):
+    # To be done:
+    # - Merge the four functions that converts CMEMS to df. Especially the .nc reading can be condensed.
+
+    def __init__(
+        self,
+        *,
+        product_id: str | None = None,
+        dataset_id: str | None = None,
+        start_time=None,
+        end_time=None,
+        area=None,
+    ):
+        self._validate_set_product_id(product_id, dataset_id)
+        self.start_time = start_time
+        self.end_time = end_time
+        self.area = area
+
+    def _validate_set_product_id(
+        self, product_id: str | None, dataset_id: str | None = None
+    ):
+        if product_id is None and dataset_id is None:
+            raise ValueError("Either product_id or dataset_id must be provided!")
+
+        if product_id is not None:
+            print(f"Loading CMEMS product id: {product_id}")
+            self.catalogue = copernicusmarine.describe(
+                product_id=product_id, disable_progress_bar=True
+            )
+            print("\tDone!")
+        elif dataset_id is not None:
+            print(f"Loading CMEMS dataset id: {dataset_id}")
+            self.catalogue = copernicusmarine.describe(
+                dataset_id=dataset_id, disable_progress_bar=True
+            )
+            print("\tDone!")
+
+    @staticmethod
+    def validate_login(
+        username: Optional[str] = None,
+        password: Optional[str] = None,
+        credentials_file: Optional[Path] = None,
+    ):
+        try:
+            _, _ = (
+                copernicusmarine.core_functions.credentials_utils.get_and_check_username_password(
+                    username, password, credentials_file
+                )
+            )
+            return True
+        except copernicusmarine.InvalidUsernameOrPassword:
+            return False
+
+    def get_satobs_data(self, start_time=None, end_time=None, area=None, filter=None):
+        """Main function that retrieves data from CMEMS through api requests"""
+
+        tmpdir = tempfile.TemporaryDirectory(prefix=".cmems_", dir=os.getcwd())
+
+        def download_2_df(dataset_id, start_time, end_time, area, filter, tmpdir):
+            if filter is None:
+                # Validate start/end time
+                start_time_ = self._parse_datetime(start_time, utc=True)
+                end_time_ = self._parse_datetime(end_time, utc=True)
+
+                dataset_meta = self.datasets.loc[dataset_id]
+                if (
+                    dataset_meta.min_date is not None
+                    and dataset_meta.max_date is not None
+                ):
+                    if end_time_ < dataset_meta.min_date:
+                        print(
+                            "Warning: end_time is before the dataset's minimum date; no data."
+                        )
+                        return None
+                    if start_time_ > dataset_meta.max_date:
+                        print(
+                            "Warning: start_time is after the dataset's maximum date; no data."
+                        )
+                        return None
+                    if not start_time_ >= dataset_meta.min_date:
+                        print(
+                            "Warning: start_time is before the dataset's minimum date."
+                        )
+                        start_time = dataset_meta.min_date.tz_convert(None)
+                    if not end_time_ <= dataset_meta.max_date:
+                        print("Warning: end_time is after the dataset's maximum date.")
+                        end_time = dataset_meta.max_date.tz_convert(None)
+                else:
+                    print(
+                        "Warning: Dataset has no min/max date info; proceeding with given time range."
+                    )
+                # Sub-function to download and convert to dataframe
+                temp_dir, file_path = self._download_copernicus_data(
+                    dataset_id, start_time, end_time, area, filter, tmpdir
+                )
+            else:
+                # Sub-function to download and convert to dataframe
+                temp_dir, file_path = self._download_copernicus_data(
+                    dataset_id, None, None, None, filter, tmpdir
+                )
+
+            # If download is successful, convert to dataframe... else emtpy
+            if temp_dir is not None and file_path is not None:
+                df = self._cmems_format_raw_data(temp_dir, file_path)
+                return df.dropna(how="all")
+
+            else:
+                return None
+
+        try:
+            # For multiple datasets at once
+            df_lst = []
+
+            dataset_ids = list(self.dataset_ids)
+
+            for i, dataset_id in enumerate(dataset_ids):
+                print(f"Downloading dataset {i+1} of {len(dataset_ids)}: {dataset_id}")
+                ## Download data
+                df = download_2_df(
+                    dataset_id, start_time, end_time, area, filter, tmpdir
+                )
+                if df is None:
+                    continue
+                ## Add meta data
+                dataset_meta = self.datasets.loc[dataset_id]
+                meta_satellite = dataset_meta.short_name
+                if dataset_meta.asc_desc is not None:  # Waves do not incl asc/desc
+                    meta_satellite += "-" + dataset_meta.asc_desc
+                df["satellite"] = meta_satellite
+                df_lst.append(df)
+
+            df = pd.concat(df_lst)
+            df = df.dropna(how="all")
+
+            tmpdir.cleanup()
+
+            # Finally, convert to AltimetryData object
+            return AltimetryData(df, area=area)
+        except Exception as e:
+            print(f"Error obtaining data! {e}")
+            tmpdir.cleanup()
+            return None
+
+    def _download_copernicus_data(
+        self,
+        dataset_id=None,
+        start_time=None,
+        end_time=None,
+        area=None,
+        filter=None,
+        tmpdir=None,
+    ):
+        """Main function that retrieves data from CMEMS through api requests
+
+        Parameters
+        ----------
+        dataset_id : str
+            String specifying the dataset to be downloaded, e.g. 'cmems_obs-wind_glo_phy_nrt_l3-hy2b-hscat-asc-0.25deg_P1D-i'
+        area : str
+            String specifying location of desired data.  The three forms allowed by the API are:
+                - polygon=6.811,54.993,8.009,54.993,8.009,57.154,6.811,57.154,6.811,54.993
+                - bbox=115,28,150,52
+                - lon=10.9&lat=55.9&radius=100
+        start_time : str, datetime, optional
+            Start of data to be retrieved, by default '20200101'
+        end_time : str, datetime, optional
+            End of data to be retrieved, by default datetime.now()
+        satellites : str, list of str, optional
+            Satellites to be downloaded, e.g. '', '3a', 'j3, by default ''
+        qual_filters : int, list[int], optional
+            Accepted qualities 0=god, 1=acceptable, 2=bad, e.g. [0, 1],
+            by default None meaning no filter (=all data)
+        filter : str, optional
+            Filter string to specify subset of data, by default None
+        Examples
+        --------
+        >>> repo = DHIAltimetryRepository(api_key="...")
+        >>> data = repo.get_altimetry_data("lon=10.9&lat=55.9&radius=10.0", start_time="2021")
+        Succesfully retrieved 133 records from API in 0.69 seconds
+
+        Returns
+        -------
+        DataFrame
+            With columns 'longitude', 'latitude', 'water_level', ...
+        """
+
+        if area is not None:
+            d = self._validate_area(area)
+        else:
+            d = {"start_date": None, "end_date": None}
+
+        if start_time is not None:
+            start_time = self._parse_datetime(start_time)
+
+        if end_time:
+            end_time = self._parse_datetime(end_time)
+        else:
+            end_time = datetime.now()
+
+        if start_time is not None and end_time is not None:
+            if start_time > end_time:
+                raise ValueError(
+                    f"end time '{end_time}' must be greater than start time '{start_time}'!"
+                )
+
+        # Handle area parsing
+        global_flag = True
+
+        if area is not None:
+            global_flag = False
+            parsed = False
+
+            dd = self._area_str_to_dict(area)
+            ar_split = dd["bbox"].split(",")
+
+            # Validate bbox coordinates
+            try:
+                bbox_coords = [float(x) for x in ar_split]
+                if len(bbox_coords) != 4:
+                    raise ValueError(f"Expected 4 coordinates, got {len(bbox_coords)}")
+            except ValueError as e:
+                raise ValueError(f"Invalid bbox coordinates: {e}")
+
+        # Create a temporary directory
+        temp_dir = Path(tmpdir.name)
+        before = set(os.listdir(temp_dir))
+
+        def cmems_get_filter(dataset_id, temp_dir, filter, download_str):
+            try:
+                copernicusmarine.get(
+                    dataset_id=dataset_id,
+                    output_directory=str(temp_dir),
+                    # filter=f"*/{year}/{month:02d}/*",
+                    filter=filter,
+                )
+            except Exception as download_error:
+                logger.error(f"Failed to download {download_str}: {download_error}")
+                raise
+
+        # Download logic
+        if not global_flag:
+            try:
+                print(f"-- Downloading subset of {dataset_id}")
+                copernicusmarine.subset(
+                    dataset_id=dataset_id,
+                    start_datetime=start_time.strftime("%Y-%m-%d"),
+                    end_datetime=end_time.strftime("%Y-%m-%d"),
+                    minimum_longitude=bbox_coords[0],
+                    maximum_longitude=bbox_coords[2],
+                    minimum_latitude=bbox_coords[1],
+                    maximum_latitude=bbox_coords[3],
+                    output_directory=str(temp_dir),
+                )
+                print("-- Download successful.")
+            except Exception as e:
+                logger.warning(
+                    f"Subset download failed: {e}. Falling back to full dataset download."
+                )
+                # Generate proper date ranges instead of month numbers
+                date_range = pd.date_range(start=start_time, end=end_time, freq="MS")
+                for period in date_range:
+                    year, month = period.year, period.month
+                    month_name = calendar.month_name[month]
+                    print(f"-- Downloading {month_name} {year}")
+                    filter = f"*/{year}/{month:02d}/*"
+                    cmems_get_filter(
+                        dataset_id, temp_dir, filter, f"{month_name} {year}"
+                    )
+
+                print("-- Download successful.")
+        else:
+            if filter is None:
+                # Generate proper date ranges
+                date_range = pd.date_range(start=start_time, end=end_time, freq="MS")
+                for period in date_range:
+                    year, month = period.year, period.month
+                    month_name = calendar.month_name[month]
+                    print(f"- Downloading {month_name} {year}")
+                    filter = f"*/{year}/{month:02d}/*"
+                    cmems_get_filter(
+                        dataset_id, temp_dir, filter, f"{month_name} {year}"
+                    )
+            else:
+                cmems_get_filter(dataset_id, temp_dir, filter, filter)
+
+        after = set(os.listdir(temp_dir))
+        downloaded = after - before
+        if len(downloaded) == 1:
+            file_path = temp_dir / list(downloaded)[0]
+        elif len(downloaded) > 1:
+            logger.warning("Multiple files downloaded, using directory path")
+            file_path = temp_dir
+        elif len(downloaded) == 0:
+            logger.warning("Empty download, no files found")
+            return None, None
+
+        return temp_dir, file_path
+
+    def get_var_float64(self, f, varname):
+        data = f[varname].astype(np.float64)
+        scale_factor = f[varname].attrs.get("scale_factor", 1.0)
+        add_offset = f[varname].attrs.get("add_offset", 0.0)
+        missing_value = f[varname].attrs.get("missing_value", None)
+        if missing_value is not None:
+            data = data.where(data != missing_value, np.nan)
+        data = data * scale_factor + add_offset
+        data = data.values.astype(np.float64).squeeze()
+        return data
+
+    def cmems_subset_wind_nc_to_df(self, file):
+        try:
+            f = xarray.open_dataset(file, decode_cf=False)
+        except FileNotFoundError:
+            print(f"File not found: {file}")
+            df = pd.DataFrame()
+            return df
+        except OSError as e:
+            print(f"Error opening file: {e}")
+            df = pd.DataFrame()
+            return df
+        except Exception as e:
+            print(f"An unexpected error occurred: {e}")
+            df = pd.DataFrame()
+            return df
+        #
+        try:
+            lon = f.longitude.values
+            lat = f.latitude.values
+        except (AttributeError, KeyError):
+            # Fall back to alternative coordinate names
+            lon = f.lon.values
+            lat = f.lat.values
+        xlon, xlat = np.meshgrid(lon, lat)
+        time = self.get_var_float64(f, "measurement_time")
+        ws = self.get_var_float64(f, "wind_speed")
+        wd = self.get_var_float64(f, "wind_to_dir")
+        uwnd = self.get_var_float64(f, "eastward_wind")
+        vwnd = self.get_var_float64(f, "northward_wind")
+        bs_date_unit = f.measurement_time.attrs["units"]
+        if not bs_date_unit.endswith("00:00:00"):
+            bs_date_unit = bs_date_unit + " 00:00:00"
+        base_date = pd.to_datetime(
+            bs_date_unit, format="seconds since %Y-%m-%d %H:%M:%S"
+        )
+
+        lat_idx, lon_idx = np.meshgrid(range(len(lat)), range(len(lon)), indexing="ij")
+        lat_idx = np.tile(lat_idx.flatten(), len(time))
+        lon_idx = np.tile(lon_idx.flatten(), len(time))
+
+        # Difference in how longitude and latitude is structure in global and subset (local) files, hence this piece of code
+        try:
+            # Build DataFrame
+            df = pd.DataFrame(
+                {
+                    "time": time.flatten(),
+                    "longitude": lon[lon_idx],
+                    "latitude": lat[lat_idx],
+                    "WS": ws.flatten(),
+                    "WD": wd.flatten(),
+                    "U10": uwnd.flatten(),
+                    "V10": vwnd.flatten(),
+                }
+            )
+        except (IndexError, ValueError) as e:
+            # Use meshgrid coordinates for global files
+            logger.debug(f"Using meshgrid coordinates: {e}")
+            df = pd.DataFrame(
+                {
+                    "time": time.flatten(),
+                    "longitude": xlon.flatten(),
+                    "latitude": xlat.flatten(),
+                    "WS": ws.flatten(),
+                    "WD": wd.flatten(),
+                    "U10": uwnd.flatten(),
+                    "V10": vwnd.flatten(),
+                }
+            )
+
+        time_deltas = pd.to_timedelta(df["time"], unit="s")
+        df["time"] = base_date + time_deltas  # base_date+time_deltas
+        df = df.set_index("time")
+        return df
+
+    def cmems_glo_wind_nc_to_df(self, file):
+        try:
+            f = xarray.open_dataset(file, decode_cf=False)
+        except FileNotFoundError:
+            print(f"File not found: {file}")
+            df = pd.DataFrame()
+            return df
+        except OSError as e:
+            print(f"Error opening file: {e}")
+            df = pd.DataFrame()
+            return df
+        except Exception as e:
+            print(f"An unexpected error occurred: {e}")
+            df = pd.DataFrame()
+            return df
+        lon = f.lon.values
+        lat = f.lat.values
+        xlon, xlat = np.meshgrid(lon, lat)
+        time = self.get_var_float64(f, "measurement_time")
+        ws = self.get_var_float64(f, "wind_speed")
+        wd = self.get_var_float64(f, "wind_to_dir")
+        uwnd = self.get_var_float64(f, "eastward_wind")
+        vwnd = self.get_var_float64(f, "northward_wind")
+        df = pd.DataFrame(
+            {
+                "time": time.flatten(),
+                "longitude": xlon.flatten(),
+                "latitude": xlat.flatten(),
+                "WS": ws.flatten(),
+                "WD": wd.flatten(),
+                "U10": uwnd.flatten(),
+                "V10": vwnd.flatten(),
+            }
+        )
+        df = df[df["WS"] >= 0.0]
+        df = df.reset_index(drop=True)
+        base_date = pd.to_datetime(
+            f.measurement_time.attrs["units"], format="seconds since %Y-%m-%d %H:%M:%S"
+        )
+        time_deltas = pd.to_timedelta(df["time"], unit="s")
+        df["time"] = base_date + time_deltas
+        df = df.set_index("time")
+        return df
+
+    def cmems_wave_csv_to_df(self, file):
+        try:
+            with open(file, "rb") as f:
+                print(f)
+                data = pd.read_csv(f)
+        except FileNotFoundError:
+            print(f"File not found: {file}")
+            df = pd.DataFrame()
+            return df
+        except OSError as e:
+            print(f"Error opening file: {e}")
+            df = pd.DataFrame()
+            return df
+        except Exception as e:
+            print(f"An unexpected error occurred: {e}")
+            df = pd.DataFrame()
+            return df
+        # Converting CMEMS WAVE .csv to rightly formatted .csv
+        df = data[data.variable == "VAVH"]
+
+        df.set_index("time", inplace=True)
+        df.index = pd.to_datetime(df.index).tz_localize(None)
+        df.index.strftime("%Y-%m-%d %H:%M:%S")
+        df = df.rename(columns={"value": "SWH"})
+        df = df.drop(
+            columns=[
+                "is_depth_from_producer",
+                "variable",
+                "platform_id",
+                "platform_type",
+                "doi",
+                "product_doi",
+                "pressure",
+                "depth",
+                "institution",
+            ]
+        )
+        return df
+
+    def cmems_glo_wave_to_df(self, file):
+        try:
+            f = xarray.open_dataset(file, decode_times=False)
+        except FileNotFoundError:
+            print(f"File not found: {file}")
+            df = pd.DataFrame()
+            return df
+        except OSError as e:
+            print(f"Error opening file: {e}")
+            df = pd.DataFrame()
+            return df
+        except Exception as e:
+            print(f"An unexpected error occurred: {e}")
+            df = pd.DataFrame()
+            return df
+        #
+        df = f.to_pandas()
+        df = df.reset_index()
+
+        base_date = pd.to_datetime(f.first_meas_time[:19], format="%Y-%m-%d %H:%M:%S")
+
+        time_deltas = pd.to_timedelta(df.index - df.index[0], unit="s")
+        df["time"] = base_date + time_deltas
+        df = df.set_index("time")
+        df = df.rename(columns={"VAVH": "SWH", "VAVH_UNFILTERED": "SWH_UNFILTERED"})
+        return df
+
+    def cmems_glo_specwave_to_df(self, file):
+        try:
+            f = xarray.open_dataset(file, decode_times=False)
+        except FileNotFoundError:
+            print(f"File not found: {file}")
+            df = pd.DataFrame()
+            return df
+        except OSError as e:
+            print(f"Error opening file: {e}")
+            df = pd.DataFrame()
+            return df
+        except Exception as e:
+            print(f"An unexpected error occurred: {e}")
+            df = pd.DataFrame()
+            return df
+
+        # Multi-dim to single dums
+        data_dict = {}
+        var_mapping = {"VAVH": "SWH", "VTPK": "TP", "VPED": "PWD"}
+
+        # Get time axis
+        idx = f["time"].mean(dim="side_looking").values
+        idx = pd.to_timedelta(idx, unit="d").round("1s") + pd.to_datetime(
+            "1950-01-01T00:00:00"
+        )
+        df_concat = []
+        for side in f["side_looking"].values:
+            data_side = {}
+            lon = f["longitude"].sel(side_looking=side).to_series()
+            lat = f["latitude"].sel(side_looking=side).to_series()
+            data_side["longitude"] = lon
+            data_side["latitude"] = lat
+            for var, var_r in var_mapping.items():
+                data_side[f"{var_r}"] = f[var].sel(side_looking=side).to_series()
+
+            df_side = pd.concat(data_side, axis=1)
+            df_side.index = idx
+            df_concat.append(df_side)
+        df = pd.concat(df_concat)
+
+        # To dataframe
+        df = df.dropna(how="all", subset=["SWH", "TP", "PWD"])
+
+        return df
+
+    def _cmems_format_raw_data(self, temp_dir, file_path):
+        print("Formatting data to DataFrame...")
+        temp_dir = Path(temp_dir)
+        file_path = Path(file_path)
+
+        if file_path.is_file():
+            if file_path.suffix == ".csv":
+                df = self.cmems_wave_csv_to_df(file_path)
+
+            elif (
+                file_path.suffix == ".nc" in str(file_path)
+                and "wind" in str(file_path).lower()
+            ):  # Maybe this needs to change, right now only wind files are .nc
+                df = self.cmems_subset_wind_nc_to_df(file_path)
+
+            elif (
+                file_path.suffix == ".nc" in str(file_path)
+                and "swh" in str(file_path).lower()
+            ):  # Maybe this needs to change, right now only wind files are .nc
+                df = self.cmems_glo_wave_to_df(file_path)
+
+            else:
+                raise ValueError("Product unknown")
+            df.to_csv(os.path.join(file_path))
+
+        else:
+            for ds in os.listdir(file_path):
+                ds_path = file_path / ds
+                years = os.listdir(ds_path)
+                df = pd.DataFrame()
+                for year in years:
+                    print(f"Merging files for {year}")
+                    year_path = ds_path / year
+                    files = list(year_path.glob("**/*.nc"))
+                    cfo = pd.DataFrame()
+
+                    for file in files:
+                        file_path_name = file_path.name.upper()
+
+                        if cfo.empty:
+                            if "WIND" in file_path_name:
+                                cfo = self.cmems_glo_wind_nc_to_df(file)
+                            elif (
+                                "WAVE" in file_path_name and "SPC" not in file_path_name
+                            ):
+                                cfo = self.cmems_glo_wave_to_df(file)
+                            elif "WAVE" in file_path_name and "SPC" in file_path_name:
+                                cfo = self.cmems_glo_specwave_to_df(file)
+                            else:
+                                logger.error(f"Unknown product type: {file_path_name}")
+                                raise ValueError(
+                                    f"Unknown product type: {file_path_name}"
+                                )
+                        else:
+                            if "WIND" in file_path_name:
+                                sing_df = self.cmems_glo_wind_nc_to_df(file)
+                            elif (
+                                "WAVE" in file_path_name and "SPC" not in file_path_name
+                            ):
+                                sing_df = self.cmems_glo_wave_to_df(file)
+                            elif "WAVE" in file_path_name and "SPC" in file_path_name:
+                                sing_df = self.cmems_glo_specwave_to_df(file)
+                            else:
+                                logger.error(f"Unknown product type: {file_path_name}")
+                                raise ValueError(
+                                    f"Unknown product type: {file_path_name}"
+                                )
+
+                            if sing_df.empty:
+                                logger.warning(f"Empty data from {file.name}, skipping")
+                                continue
+                            else:
+                                cfo = pd.concat([cfo, sing_df], axis=0)
+                                logger.debug(f"Reading {file.name}")
+                    df = pd.concat([df, cfo], axis=0)
+
+        print("\tDone!")
+        return df
+
+    def get_observation_stats(self):
+        df = (
+            self.datasets.groupby("short_name").first().loc[:, ["min_date", "max_date"]]
+        )
+        return df
+
+    @property
+    def datasets(self):
+        df = get_catalogue_info(self.catalogue)
+
+        if "asc_desc" in df.columns:
+            keys = ["short_name", "asc_desc"]
+        else:
+            keys = ["short_name"]
+
+        # For now, just get highest resolution
+        if "spatial_resolution" not in df.columns:
+            return df
+        else:
+            if len(df["spatial_resolution"].dropna()) == 0:
+                return df
+            df_tmp = df.copy()
+            df_tmp["spatial_resolution"] = [
+                float(res.split("deg")[0]) for res in df["spatial_resolution"]
+            ]
+            idx = df_tmp.groupby(keys)["spatial_resolution"].idxmin()
+            df = df.loc[idx]
+            return df
+
+    @property
+    def dataset_ids(self):
+        return list(self.datasets.index.values)
